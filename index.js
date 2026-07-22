@@ -8,14 +8,17 @@ app.use(cors());
 app.use(express.json());
 const scanSessions = new Map();
 let scanEventId = 1;
+const port = Number(process.env.PORT || 5000);
 
-const pool = new Pool({
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST,
-    database: process.env.DB_NAME,
-    password: process.env.DB_PASSWORD,
-    port: process.env.DB_PORT,
-});
+const pool = new Pool(process.env.DATABASE_URL
+    ? { connectionString: process.env.DATABASE_URL }
+    : {
+        user: process.env.DB_USER || process.env.PGUSER,
+        host: process.env.DB_HOST || process.env.PGHOST,
+        database: process.env.DB_NAME || process.env.PGDATABASE,
+        password: process.env.DB_PASSWORD || process.env.PGPASSWORD,
+        port: process.env.DB_PORT || process.env.PGPORT,
+    });
 
 function dateKey(date = new Date()) {
     const year = date.getFullYear();
@@ -1447,12 +1450,16 @@ app.get('/api/scan-sessions/:sessionId/events', (req, res) => {
     res.json(events.filter((event) => event.id > after));
 });
 
+app.get('/health', (_req, res) => {
+    res.json({ ok: true });
+});
+
 initializeCartTables()
     .catch((err) => {
         console.error('Could not initialize backend database:', err.message);
     })
     .finally(() => {
-        app.listen(5000, () => {
-            console.log("Server is running on port 5000 🚀");
+        app.listen(port, () => {
+            console.log(`Server is running on port ${port} 🚀`);
         });
     });
