@@ -1783,6 +1783,51 @@ app.post('/api/auth/logout', async (req, res) => {
     res.json({ ok: true });
 });
 
+app.patch('/api/auth/password', async (req, res) => {
+    const currentPassword = String(req.body.currentPassword || req.body.current_password || '');
+    const newPassword = String(req.body.newPassword || req.body.new_password || '');
+
+    if (!currentPassword || newPassword.length < 6) {
+        return res.status(400).json({ error: 'currentPassword and newPassword >= 6 are required' });
+    }
+
+    const authorization = String(req.headers.authorization || '');
+    const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+    const tokenHash = token ? sha256(token) : '';
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT * FROM app_users WHERE id = $1 AND active = TRUE FOR UPDATE', [req.user.id]);
+        const user = before.rows[0];
+        if (!user || !verifyPassword(currentPassword, user)) {
+            await client.query('ROLLBACK');
+            return res.status(401).json({ error: 'current password is incorrect' });
+        }
+
+        const { salt, hash } = hashPassword(newPassword);
+        const result = await client.query(`
+            UPDATE app_users
+            SET password_hash = $1,
+                password_salt = $2,
+                updated_at = NOW()
+            WHERE id = $3
+            RETURNING id, username, display_name, role, active, created_at, updated_at
+        `, [hash, salt, req.user.id]);
+        if (tokenHash) {
+            await client.query('DELETE FROM app_user_sessions WHERE user_id = $1 AND token_hash <> $2', [req.user.id, tokenHash]);
+        }
+        await logAudit(client, req, 'UPDATE', 'USER_PASSWORD', req.user.id, 'change own password', sanitizeUser(user), sanitizeUser(result.rows[0]));
+        await client.query('COMMIT');
+        res.json({ ok: true, user: sanitizeUser(result.rows[0]) });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
 app.get('/api/users', requireOwner, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -2211,6 +2256,19 @@ app.delete('/api/members/:memberId', requireOwner, async (req, res) => {
 app.get('/api/app-sessions/today', async (req, res) => {
     try {
         const session = await ensureAppSession(dailySessionId());
+        res.json({
+            ...session,
+            previousClosedSession: await getPreviousClosedSession(session.business_date),
+        });
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || "Database error" });
+    }
+});
+
+app.get('/api/app-sessions/:sessionId', async (req, res) => {
+    try {
+        const session = await ensureAppSession(req.params.sessionId);
         res.json({
             ...session,
             previousClosedSession: await getPreviousClosedSession(session.business_date),
