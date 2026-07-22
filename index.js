@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -20,11 +21,133 @@ const pool = new Pool(process.env.DATABASE_URL
         port: process.env.DB_PORT || process.env.PGPORT,
     });
 
+const USER_ROLES = new Set(['owner', 'user']);
+const OWNER_ROLE = 'owner';
+const USER_ROLE = 'user';
+const SESSION_PENDING_OPEN = 'PENDING_OPEN';
+const SESSION_OPEN = 'OPEN';
+const SESSION_CLOSED = 'CLOSED';
+const LEGACY_OPEN_STATUS = 'ACTIVE';
+const CLOSING_SECTIONS = ['POS', 'GAS', 'LOTTERY', 'TOPUP', 'STOCK'];
+const PASSWORD_ITERATIONS = 120000;
+const SESSION_TTL_DAYS = 14;
+
+function sha256(value) {
+    return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+    const hash = crypto.pbkdf2Sync(String(password), salt, PASSWORD_ITERATIONS, 64, 'sha512').toString('hex');
+    return { salt, hash };
+}
+
+function verifyPassword(password, user) {
+    const expected = crypto.pbkdf2Sync(
+        String(password),
+        user.password_salt,
+        PASSWORD_ITERATIONS,
+        64,
+        'sha512',
+    ).toString('hex');
+    return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(user.password_hash, 'hex'));
+}
+
+function sanitizeUser(row) {
+    if (!row) {
+        return null;
+    }
+
+    return {
+        id: Number(row.id),
+        username: row.username,
+        displayName: row.display_name,
+        role: row.role,
+        active: Boolean(row.active),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+    };
+}
+
+function actorFromRequest(req) {
+    return req.user
+        ? {
+            id: req.user.id,
+            name: req.user.display_name || req.user.username,
+            role: req.user.role,
+        }
+        : {
+            id: null,
+            name: 'system',
+            role: 'system',
+        };
+}
+
+function requireOwner(req, res, next) {
+    if (req.user?.role !== OWNER_ROLE) {
+        return res.status(403).json({ error: 'Owner permission is required' });
+    }
+
+    next();
+}
+
+async function requireAuth(req, res, next) {
+    if (req.method === 'OPTIONS') {
+        return next();
+    }
+
+    const authorization = String(req.headers.authorization || '');
+    const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+    if (!token) {
+        return res.status(401).json({ error: 'Login is required' });
+    }
+
+    try {
+        const result = await pool.query(`
+            SELECT
+                u.id,
+                u.username,
+                u.display_name,
+                u.role,
+                u.active,
+                u.created_at,
+                u.updated_at
+            FROM app_user_sessions s
+            JOIN app_users u ON u.id = s.user_id
+            WHERE s.token_hash = $1
+              AND s.expires_at > NOW()
+              AND u.active = TRUE
+            LIMIT 1
+        `, [sha256(token)]);
+
+        const user = result.rows[0];
+        if (!user) {
+            return res.status(401).json({ error: 'Login session expired' });
+        }
+
+        req.user = sanitizeUser(user);
+        await pool.query('UPDATE app_user_sessions SET last_seen_at = NOW() WHERE token_hash = $1', [sha256(token)]);
+        next();
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    }
+}
+
 function dateKey(date = new Date()) {
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
+}
+
+function businessDateKey(value) {
+    if (!value) {
+        return dateKey();
+    }
+    if (typeof value === 'string') {
+        return value.slice(0, 10);
+    }
+    return dateKey(new Date(value));
 }
 
 function dailySessionId(date = new Date()) {
@@ -49,14 +172,122 @@ function createSaleId(prefix, date = new Date()) {
     return `${prefix}-${year}${month}${day}-${hour}${minute}${second}`;
 }
 
+function createTopupId(date = new Date()) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hour = String(date.getHours()).padStart(2, '0');
+    const minute = String(date.getMinutes()).padStart(2, '0');
+    const second = String(date.getSeconds()).padStart(2, '0');
+    return `TOPUP-${year}${month}${day}-${hour}${minute}${second}`;
+}
+
 async function initializeCartTables() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS categories (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            barcode TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            price NUMERIC(12, 2) NOT NULL DEFAULT 0,
+            cost NUMERIC(12, 2) NOT NULL DEFAULT 0,
+            stock INTEGER NOT NULL DEFAULT 0,
+            category_id INTEGER REFERENCES categories(id),
+            min_stock INTEGER NOT NULL DEFAULT 5,
+            unit TEXT NOT NULL DEFAULT 'piece',
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS min_stock INTEGER NOT NULL DEFAULT 5`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'piece'`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+    await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS app_users (
+            id SERIAL PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            password_salt TEXT NOT NULL,
+            role VARCHAR(20) NOT NULL CHECK (role IN ('owner', 'user')),
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS app_user_sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+            expires_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS staff_members (
+            id VARCHAR(40) PRIMARY KEY,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT 'staff',
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS members (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL UNIQUE,
+            note TEXT NOT NULL DEFAULT '',
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
     await pool.query(`
         CREATE TABLE IF NOT EXISTS app_sessions (
             session_id VARCHAR(80) PRIMARY KEY,
             business_date DATE NOT NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+            status VARCHAR(20) NOT NULL DEFAULT 'PENDING_OPEN',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`ALTER TABLE app_sessions ALTER COLUMN status SET DEFAULT 'PENDING_OPEN'`);
+    await pool.query(`ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS opened_by INTEGER REFERENCES app_users(id)`);
+    await pool.query(`ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS closed_by INTEGER REFERENCES app_users(id)`);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS app_session_closing_checks (
+            session_id VARCHAR(80) NOT NULL REFERENCES app_sessions(session_id) ON DELETE CASCADE,
+            section VARCHAR(20) NOT NULL,
+            confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+            confirmed_by INTEGER REFERENCES app_users(id),
+            confirmed_at TIMESTAMPTZ,
+            note TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (session_id, section)
         )
     `);
 
@@ -110,6 +341,11 @@ async function initializeCartTables() {
             note TEXT
         )
     `);
+
+    await pool.query(`ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS cancel_reason TEXT`);
+    await pool.query(`ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES app_users(id)`);
+    await pool.query(`ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
 
     await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_sales_records_session_created
@@ -188,6 +424,21 @@ async function initializeCartTables() {
     `);
 
     await pool.query(`
+        ALTER TABLE gas_jobs
+        ADD COLUMN IF NOT EXISTS cancel_reason TEXT
+    `);
+
+    await pool.query(`
+        ALTER TABLE gas_jobs
+        ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ
+    `);
+
+    await pool.query(`
+        ALTER TABLE gas_jobs
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    `);
+
+    await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_gas_jobs_session_created
         ON gas_jobs (session_id, created_at DESC)
     `);
@@ -220,10 +471,469 @@ async function initializeCartTables() {
         )
     `);
 
+    await pool.query(`ALTER TABLE gas_returns ADD COLUMN IF NOT EXISTS returned_quantity INTEGER NOT NULL DEFAULT 0`);
+    await pool.query(`ALTER TABLE gas_returns ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ`);
+
     await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_gas_returns_session_status
         ON gas_returns (session_id, status, borrowed_at DESC)
     `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS lottery_tickets (
+            id SERIAL PRIMARY KEY,
+            number VARCHAR(6) NOT NULL UNIQUE,
+            series TEXT NOT NULL DEFAULT 'Manual',
+            price NUMERIC(12, 2) NOT NULL DEFAULT 0,
+            remaining INTEGER NOT NULL DEFAULT 0,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS lottery_cart_sessions (
+            session_id VARCHAR(80) PRIMARY KEY REFERENCES app_sessions(session_id) ON DELETE CASCADE,
+            status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS lottery_cart_items (
+            id SERIAL PRIMARY KEY,
+            session_id VARCHAR(80) NOT NULL REFERENCES lottery_cart_sessions(session_id) ON DELETE CASCADE,
+            ticket_id INTEGER NOT NULL REFERENCES lottery_tickets(id),
+            number VARCHAR(6) NOT NULL,
+            series TEXT NOT NULL DEFAULT 'Manual',
+            price NUMERIC(12, 2) NOT NULL DEFAULT 0,
+            quantity INTEGER NOT NULL CHECK (quantity > 0),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (session_id, ticket_id)
+        )
+    `);
+
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_lottery_cart_items_session_id
+        ON lottery_cart_items (session_id)
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS mobile_topup_orders (
+            id VARCHAR(80) PRIMARY KEY,
+            session_id VARCHAR(80) NOT NULL REFERENCES app_sessions(session_id) ON DELETE CASCADE,
+            provider VARCHAR(20) NOT NULL,
+            phone TEXT NOT NULL,
+            amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+            topped_up BOOLEAN NOT NULL DEFAULT FALSE,
+            paid BOOLEAN NOT NULL DEFAULT FALSE,
+            status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+            cancel_reason TEXT,
+            created_by INTEGER REFERENCES app_users(id),
+            cancelled_by INTEGER REFERENCES app_users(id),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            cancelled_at TIMESTAMPTZ
+        )
+    `);
+
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_mobile_topup_orders_session_created
+        ON mobile_topup_orders (session_id, created_at DESC)
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS inventory_movements (
+            id SERIAL PRIMARY KEY,
+            item_type VARCHAR(20) NOT NULL,
+            item_id TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            delta INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            source_type VARCHAR(40) NOT NULL,
+            source_id TEXT NOT NULL,
+            reversed_from INTEGER REFERENCES inventory_movements(id),
+            created_by INTEGER REFERENCES app_users(id),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_inventory_movements_source
+        ON inventory_movements (source_type, source_id)
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id SERIAL PRIMARY KEY,
+            actor_user_id INTEGER REFERENCES app_users(id),
+            actor_name TEXT NOT NULL DEFAULT 'system',
+            action TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            reason TEXT,
+            before_data JSONB,
+            after_data JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_entity
+        ON audit_logs (entity_type, entity_id, created_at DESC)
+    `);
+
+    await ensureDefaultOwner();
+    await ensureDefaultStaff();
+}
+
+async function ensureDefaultOwner() {
+    const existingOwner = await pool.query("SELECT id FROM app_users WHERE role = 'owner' LIMIT 1");
+    if (existingOwner.rows[0]) {
+        return;
+    }
+
+    const username = process.env.DEFAULT_OWNER_USERNAME || 'owner';
+    const password = process.env.DEFAULT_OWNER_PASSWORD || 'owner1234';
+    const displayName = process.env.DEFAULT_OWNER_NAME || 'Owner';
+    const { salt, hash } = hashPassword(password);
+
+    await pool.query(`
+        INSERT INTO app_users (username, display_name, password_hash, password_salt, role, active)
+        VALUES ($1, $2, $3, $4, 'owner', TRUE)
+        ON CONFLICT (username) DO NOTHING
+    `, [username, displayName, hash, salt]);
+}
+
+async function ensureDefaultStaff() {
+    const result = await pool.query('SELECT id FROM staff_members LIMIT 1');
+    if (result.rows[0]) {
+        return;
+    }
+
+    await pool.query(`
+        INSERT INTO staff_members (id, name, phone, role, active)
+        VALUES ('S-001', 'Owner', '', 'owner', TRUE)
+        ON CONFLICT (id) DO NOTHING
+    `);
+}
+
+function mapStaff(row) {
+    return {
+        id: row.id,
+        name: row.name,
+        phone: row.phone || '',
+        role: row.role || 'staff',
+        active: Boolean(row.active),
+    };
+}
+
+function mapMember(row) {
+    return {
+        id: String(row.id),
+        name: row.name,
+        phone: row.phone,
+        note: row.note || '',
+        active: Boolean(row.active),
+    };
+}
+
+function normalizeAppSessionStatus(status) {
+    return status === LEGACY_OPEN_STATUS ? SESSION_OPEN : status;
+}
+
+function isOpenSessionStatus(status) {
+    return normalizeAppSessionStatus(status) === SESSION_OPEN;
+}
+
+function mapAppSession(row) {
+    return {
+        session_id: row.session_id,
+        business_date: businessDateKey(row.business_date),
+        status: normalizeAppSessionStatus(row.status),
+        rawStatus: row.status,
+        openedAt: row.opened_at || null,
+        closedAt: row.closed_at || null,
+        openedBy: row.opened_by === undefined || row.opened_by === null ? null : Number(row.opened_by),
+        closedBy: row.closed_by === undefined || row.closed_by === null ? null : Number(row.closed_by),
+    };
+}
+
+function mapProduct(row) {
+    return {
+        id: Number(row.id),
+        barcode: row.barcode,
+        name: row.name,
+        price: Number(row.price),
+        cost: row.cost === undefined || row.cost === null ? undefined : Number(row.cost),
+        stock: Number(row.stock),
+        category_id: row.category_id,
+        category: row.category || null,
+        min_stock: row.min_stock === undefined || row.min_stock === null ? 5 : Number(row.min_stock),
+        unit: row.unit || 'piece',
+        active: row.active === undefined ? true : Boolean(row.active),
+    };
+}
+
+function mapLotteryTicket(row) {
+    return {
+        id: Number(row.id),
+        number: row.number,
+        series: row.series || 'Manual',
+        price: Number(row.price),
+        remaining: Number(row.remaining),
+        active: Boolean(row.active),
+    };
+}
+
+function mapTopupOrder(row) {
+    return {
+        id: row.id,
+        provider: row.provider,
+        phone: row.phone,
+        amount: Number(row.amount),
+        toppedUp: Boolean(row.topped_up),
+        paid: Boolean(row.paid),
+        status: row.status,
+        cancelReason: row.cancel_reason || '',
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        cancelledAt: row.cancelled_at,
+    };
+}
+
+function resolveTopupSaleStatus(row) {
+    if (row.status === 'CANCELLED') {
+        return 'CANCELLED';
+    }
+
+    return row.topped_up && row.paid ? 'completed' : 'pending';
+}
+
+function mapTopupSaleRecord(row) {
+    const amount = Number(row.amount);
+    const provider = row.provider || 'TOPUP';
+    const phone = row.phone || '';
+    return {
+        id: row.id,
+        channel: 'TOPUP',
+        createdAt: row.created_at,
+        customerName: phone || 'Walk-in',
+        staffName: row.created_by_name || 'system',
+        paymentMethod: 'เงินสด',
+        status: resolveTopupSaleStatus(row),
+        items: [
+            {
+                id: row.id,
+                name: `Topup ${provider}`,
+                barcode: phone,
+                quantity: 1,
+                price: amount,
+                discount: 0,
+            },
+        ],
+        subtotal: amount,
+        discount: 0,
+        total: amount,
+        cashReceived: row.paid ? amount : 0,
+        change: 0,
+        note: [
+            `Provider: ${provider}`,
+            phone ? `Phone: ${phone}` : '',
+            row.topped_up ? 'Topped up' : 'Pending topup',
+            row.paid ? 'Paid' : 'Unpaid',
+        ].filter(Boolean).join(' | '),
+        cancelReason: row.cancel_reason || undefined,
+        cancelledAt: row.cancelled_at || undefined,
+    };
+}
+
+function mapInventoryMovement(row) {
+    return {
+        id: String(row.id),
+        productName: row.item_name,
+        itemType: row.item_type,
+        itemId: row.item_id,
+        delta: Number(row.delta),
+        reason: row.reason || '',
+        staffName: row.actor_name || 'system',
+        createdAt: row.created_at,
+        date: dateKey(new Date(row.created_at)),
+        sourceType: row.source_type,
+        sourceId: row.source_id,
+    };
+}
+
+async function logAudit(client, req, action, entityType, entityId, reason, beforeData, afterData) {
+    const actor = actorFromRequest(req);
+    await client.query(`
+        INSERT INTO audit_logs (
+            actor_user_id,
+            actor_name,
+            action,
+            entity_type,
+            entity_id,
+            reason,
+            before_data,
+            after_data
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)
+    `, [
+        actor.id,
+        actor.name,
+        action,
+        entityType,
+        String(entityId),
+        reason || null,
+        beforeData === undefined ? null : JSON.stringify(beforeData),
+        afterData === undefined ? null : JSON.stringify(afterData),
+    ]);
+}
+
+async function recordInventoryMovement(client, req, movement) {
+    const actor = actorFromRequest(req);
+    await client.query(`
+        INSERT INTO inventory_movements (
+            item_type,
+            item_id,
+            item_name,
+            delta,
+            reason,
+            source_type,
+            source_id,
+            reversed_from,
+            created_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `, [
+        movement.itemType,
+        String(movement.itemId),
+        movement.itemName,
+        Math.trunc(Number(movement.delta)),
+        movement.reason || '',
+        movement.sourceType,
+        String(movement.sourceId),
+        movement.reversedFrom || null,
+        actor.id,
+    ]);
+}
+
+async function adjustProductStock(client, req, productId, delta, reason, sourceType, sourceId, reversedFrom = null) {
+    const result = await client.query(`
+        UPDATE products
+        SET stock = GREATEST(0, COALESCE(stock, 0) + $1),
+            updated_at = NOW()
+        WHERE id = $2
+        RETURNING id, name, stock
+    `, [Math.trunc(Number(delta)), Number(productId)]);
+
+    if (!result.rows[0]) {
+        const error = new Error('product not found');
+        error.statusCode = 404;
+        throw error;
+    }
+
+    await recordInventoryMovement(client, req, {
+        itemType: 'PRODUCT',
+        itemId: productId,
+        itemName: result.rows[0].name,
+        delta,
+        reason,
+        sourceType,
+        sourceId,
+        reversedFrom,
+    });
+
+    return result.rows[0];
+}
+
+async function adjustGasStock(client, req, gasItemId, delta, reason, sourceType, sourceId, reversedFrom = null) {
+    const result = await client.query(`
+        UPDATE gas_items
+        SET stock = GREATEST(0, COALESCE(stock, 0) + $1),
+            updated_at = NOW()
+        WHERE id = $2
+        RETURNING id, name, operation, stock
+    `, [Math.trunc(Number(delta)), String(gasItemId)]);
+
+    if (!result.rows[0]) {
+        const error = new Error('gas item not found');
+        error.statusCode = 404;
+        throw error;
+    }
+
+    await recordInventoryMovement(client, req, {
+        itemType: 'GAS',
+        itemId: gasItemId,
+        itemName: `${result.rows[0].name} ${result.rows[0].operation}`,
+        delta,
+        reason,
+        sourceType,
+        sourceId,
+        reversedFrom,
+    });
+
+    return result.rows[0];
+}
+
+async function adjustLotteryStock(client, req, ticketId, delta, reason, sourceType, sourceId, reversedFrom = null) {
+    const result = await client.query(`
+        UPDATE lottery_tickets
+        SET remaining = GREATEST(0, COALESCE(remaining, 0) + $1),
+            updated_at = NOW()
+        WHERE id = $2
+        RETURNING id, number, series, remaining
+    `, [Math.trunc(Number(delta)), Number(ticketId)]);
+
+    if (!result.rows[0]) {
+        const error = new Error('lottery ticket not found');
+        error.statusCode = 404;
+        throw error;
+    }
+
+    await recordInventoryMovement(client, req, {
+        itemType: 'LOTTERY',
+        itemId: ticketId,
+        itemName: `${result.rows[0].number} ${result.rows[0].series}`,
+        delta,
+        reason,
+        sourceType,
+        sourceId,
+        reversedFrom,
+    });
+
+    return result.rows[0];
+}
+
+async function reverseInventoryMovements(client, req, sourceType, sourceId, reason) {
+    const result = await client.query(`
+        SELECT m.*
+        FROM inventory_movements m
+        WHERE m.source_type = $1
+          AND m.source_id = $2
+          AND NOT EXISTS (
+              SELECT 1
+              FROM inventory_movements r
+              WHERE r.reversed_from = m.id
+          )
+        ORDER BY m.id DESC
+    `, [sourceType, String(sourceId)]);
+
+    for (const movement of result.rows) {
+        const reverseDelta = -Number(movement.delta);
+        if (movement.item_type === 'PRODUCT') {
+            await adjustProductStock(client, req, Number(movement.item_id), reverseDelta, reason, `${sourceType}_REVERSAL`, sourceId, movement.id);
+        } else if (movement.item_type === 'GAS') {
+            await adjustGasStock(client, req, movement.item_id, reverseDelta, reason, `${sourceType}_REVERSAL`, sourceId, movement.id);
+        } else if (movement.item_type === 'LOTTERY') {
+            await adjustLotteryStock(client, req, Number(movement.item_id), reverseDelta, reason, `${sourceType}_REVERSAL`, sourceId, movement.id);
+        }
+    }
+
+    return result.rows.length;
 }
 
 async function ensureCategory(name, client = pool) {
@@ -253,14 +963,27 @@ async function ensureAppSession(sessionId, client = pool) {
         ? `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`
         : dateKey();
 
-    await client.query(`
-        INSERT INTO app_sessions (session_id, business_date)
-        VALUES ($1, $2::date)
+    const result = await client.query(`
+        INSERT INTO app_sessions (session_id, business_date, status)
+        VALUES ($1, $2::date, $3)
         ON CONFLICT (session_id)
         DO UPDATE SET updated_at = NOW()
-    `, [normalizedSessionId, businessDate]);
+        RETURNING session_id, business_date, status, opened_at, opened_by, closed_at, closed_by
+    `, [normalizedSessionId, businessDate, SESSION_PENDING_OPEN]);
 
-    return { session_id: normalizedSessionId, business_date: businessDate };
+    return mapAppSession(result.rows[0]);
+}
+
+async function ensureOpenAppSession(sessionId, client = pool) {
+    const session = await ensureAppSession(sessionId, client);
+    if (!isOpenSessionStatus(session.status)) {
+        const error = new Error(session.status === SESSION_CLOSED ? 'shop is closed' : 'shop is not open');
+        error.statusCode = 409;
+        error.session = session;
+        throw error;
+    }
+
+    return session;
 }
 
 function mapCartItem(row) {
@@ -276,7 +999,7 @@ function mapCartItem(row) {
 }
 
 async function ensureCartSession(sessionId, client = pool) {
-    const session = await ensureAppSession(sessionId, client);
+    const session = await ensureOpenAppSession(sessionId, client);
     const normalizedSessionId = session.session_id;
 
     await client.query(`
@@ -305,6 +1028,8 @@ function mapSaleRecord(row) {
         cashReceived: Number(row.cash_received),
         change: Number(row.change),
         note: row.note || undefined,
+        cancelReason: row.cancel_reason || undefined,
+        cancelledAt: row.cancelled_at || undefined,
     };
 }
 
@@ -316,6 +1041,7 @@ function mapGasItem(row) {
         price: Number(row.price),
         stock: Number(row.stock),
         imageUrl: row.image_url || '',
+        active: row.active === undefined ? true : Boolean(row.active),
     };
 }
 
@@ -344,6 +1070,31 @@ async function getSalesRecords(sessionId, client = pool) {
     `, [sessionId]);
 
     return result.rows.map(mapSaleRecord);
+}
+
+async function getTopupSaleRecords(sessionId, client = pool) {
+    const result = await client.query(`
+        SELECT
+            t.*,
+            COALESCE(u.display_name, u.username, 'system') AS created_by_name
+        FROM mobile_topup_orders t
+        LEFT JOIN app_users u ON u.id = t.created_by
+        WHERE t.session_id = $1
+        ORDER BY t.created_at DESC
+    `, [sessionId]);
+
+    return result.rows.map(mapTopupSaleRecord);
+}
+
+function sortSaleRecordsByCreatedAt(records) {
+    return records.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+}
+
+async function getCombinedSaleRecords(sessionId, client = pool) {
+    const sales = await getSalesRecords(sessionId, client);
+    const topups = await getTopupSaleRecords(sessionId, client);
+
+    return sortSaleRecordsByCreatedAt([...sales, ...topups]);
 }
 
 function dateFromUtcParts(year, month, day) {
@@ -419,6 +1170,360 @@ async function getSalesRecordsByDateRange(startDate, endDate, client = pool) {
     return result.rows.map(mapSaleRecord);
 }
 
+async function getTopupSaleRecordsByDateRange(startDate, endDate, client = pool) {
+    const result = await client.query(`
+        SELECT
+            t.*,
+            COALESCE(u.display_name, u.username, 'system') AS created_by_name
+        FROM mobile_topup_orders t
+        LEFT JOIN app_users u ON u.id = t.created_by
+        WHERE t.created_at >= ($1::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+          AND t.created_at < ($2::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+        ORDER BY t.created_at DESC
+    `, [startDate, endDate]);
+
+    return result.rows.map(mapTopupSaleRecord);
+}
+
+async function getCombinedSaleRecordsByDateRange(startDate, endDate, client = pool) {
+    const sales = await getSalesRecordsByDateRange(startDate, endDate, client);
+    const topups = await getTopupSaleRecordsByDateRange(startDate, endDate, client);
+
+    return sortSaleRecordsByCreatedAt([...sales, ...topups]);
+}
+
+async function getClosingChecks(sessionId, client = pool) {
+    const result = await client.query(`
+        SELECT
+            c.section,
+            c.confirmed,
+            c.confirmed_at,
+            c.note,
+            COALESCE(u.display_name, u.username, '') AS confirmed_by_name
+        FROM app_session_closing_checks c
+        LEFT JOIN app_users u ON u.id = c.confirmed_by
+        WHERE c.session_id = $1
+    `, [sessionId]);
+
+    const checks = new Map(CLOSING_SECTIONS.map((section) => [section, {
+        section,
+        confirmed: false,
+        confirmedAt: null,
+        confirmedBy: '',
+        note: '',
+    }]));
+
+    result.rows.forEach((row) => {
+        checks.set(row.section, {
+            section: row.section,
+            confirmed: Boolean(row.confirmed),
+            confirmedAt: row.confirmed_at,
+            confirmedBy: row.confirmed_by_name || '',
+            note: row.note || '',
+        });
+    });
+
+    return Array.from(checks.values());
+}
+
+async function getPreviousClosedSession(beforeBusinessDate, client = pool) {
+    const result = await client.query(`
+        SELECT session_id, business_date, status, opened_at, opened_by, closed_at, closed_by
+        FROM app_sessions
+        WHERE business_date < $1::date
+          AND status = $2
+        ORDER BY business_date DESC
+        LIMIT 1
+    `, [beforeBusinessDate, SESSION_CLOSED]);
+
+    return result.rows[0] ? mapAppSession(result.rows[0]) : null;
+}
+
+async function getClosingSummary(sessionId, client = pool) {
+    const session = await ensureAppSession(sessionId, client);
+    const businessDate = businessDateKey(session.business_date);
+    const nextBusinessDate = addUtcDays(businessDate, 1);
+
+    const posTotalsResult = await client.query(`
+        SELECT
+            COUNT(*)::int AS bill_count,
+            COALESCE(SUM(total), 0) AS total,
+            COALESCE(SUM(subtotal), 0) AS subtotal,
+            COALESCE(SUM(discount), 0) AS discount
+        FROM sales_records
+        WHERE session_id = $1
+          AND channel = 'POS'
+          AND status <> 'CANCELLED'
+    `, [session.session_id]);
+
+    const posItemsResult = await client.query(`
+        SELECT
+            item.value->>'name' AS name,
+            COALESCE(item.value->>'barcode', '') AS barcode,
+            COALESCE(SUM((item.value->>'quantity')::numeric), 0) AS quantity,
+            COALESCE(SUM(
+                GREATEST(
+                    0,
+                    COALESCE((item.value->>'price')::numeric, 0) * COALESCE((item.value->>'quantity')::numeric, 0)
+                    - COALESCE((item.value->>'discount')::numeric, 0)
+                )
+            ), 0) AS total
+        FROM sales_records s
+        CROSS JOIN LATERAL jsonb_array_elements(s.items) AS item(value)
+        WHERE s.session_id = $1
+          AND s.channel = 'POS'
+          AND s.status <> 'CANCELLED'
+        GROUP BY item.value->>'name', COALESCE(item.value->>'barcode', '')
+        ORDER BY quantity DESC, name ASC
+        LIMIT 120
+    `, [session.session_id]);
+
+    const lotteryTotalsResult = await client.query(`
+        SELECT
+            COUNT(*)::int AS bill_count,
+            COALESCE(SUM(total), 0) AS total
+        FROM sales_records
+        WHERE session_id = $1
+          AND channel = 'LOTTERY'
+          AND status <> 'CANCELLED'
+    `, [session.session_id]);
+
+    const lotteryItemsResult = await client.query(`
+        SELECT
+            COALESCE(item.value->>'number', item.value->>'barcode', item.value->>'name') AS number,
+            COALESCE(SUM((item.value->>'quantity')::numeric), 0) AS quantity,
+            COALESCE(SUM(COALESCE((item.value->>'price')::numeric, 0) * COALESCE((item.value->>'quantity')::numeric, 0)), 0) AS total
+        FROM sales_records s
+        CROSS JOIN LATERAL jsonb_array_elements(s.items) AS item(value)
+        WHERE s.session_id = $1
+          AND s.channel = 'LOTTERY'
+          AND s.status <> 'CANCELLED'
+        GROUP BY COALESCE(item.value->>'number', item.value->>'barcode', item.value->>'name')
+        ORDER BY quantity DESC, number ASC
+        LIMIT 120
+    `, [session.session_id]);
+
+    const gasTotalsResult = await client.query(`
+        SELECT
+            COUNT(*)::int AS job_count,
+            COALESCE(SUM(total), 0) AS total,
+            COALESCE(SUM(delivery_fee), 0) AS delivery_fee_total,
+            COALESCE(SUM(returned_tank_quantity), 0) AS returned_tank_quantity
+        FROM gas_jobs
+        WHERE session_id = $1
+          AND status <> 'CANCELLED'
+    `, [session.session_id]);
+
+    const gasItemsResult = await client.query(`
+        SELECT
+            COALESCE(i.gas_item_id, i.name) AS id,
+            i.name,
+            i.operation,
+            COALESCE(SUM(i.quantity), 0) AS quantity,
+            COALESCE(SUM(i.quantity * i.price), 0) AS total
+        FROM gas_jobs j
+        JOIN gas_job_items i ON i.job_id = j.id
+        WHERE j.session_id = $1
+          AND j.status <> 'CANCELLED'
+        GROUP BY COALESCE(i.gas_item_id, i.name), i.name, i.operation
+        ORDER BY quantity DESC, i.name ASC
+    `, [session.session_id]);
+
+    const gasPendingResult = await client.query(`
+        SELECT
+            COALESCE(gas_item_id, tank_name) AS id,
+            tank_name,
+            COALESCE(SUM(quantity), 0) AS quantity
+        FROM gas_returns
+        WHERE session_id = $1
+          AND status = 'PENDING'
+        GROUP BY COALESCE(gas_item_id, tank_name), tank_name
+    `, [session.session_id]);
+
+    const gasBalanceResult = await client.query(`
+        WITH day_movements AS (
+            SELECT *
+            FROM inventory_movements
+            WHERE item_type = 'GAS'
+              AND created_at >= ($1::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+              AND created_at < ($2::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+        ),
+        pending_returns AS (
+            SELECT gas_item_id::text AS item_id, COALESCE(SUM(quantity), 0) AS pending_quantity
+            FROM gas_returns
+            WHERE session_id = $3
+              AND status = 'PENDING'
+              AND gas_item_id IS NOT NULL
+            GROUP BY gas_item_id
+        )
+        SELECT
+            g.id,
+            g.name,
+            g.operation,
+            g.stock,
+            COALESCE(SUM(dm.delta), 0) AS movement_delta,
+            COALESCE(SUM(CASE WHEN dm.source_type = 'GAS_JOB' AND dm.delta < 0 THEN -dm.delta ELSE 0 END), 0) AS sold_quantity,
+            COALESCE(SUM(CASE WHEN dm.source_type = 'GAS_JOB' AND dm.delta > 0 THEN dm.delta ELSE 0 END), 0) AS returned_quantity,
+            COALESCE(SUM(CASE WHEN dm.source_type <> 'GAS_JOB' THEN dm.delta ELSE 0 END), 0) AS adjusted_quantity,
+            COALESCE(pr.pending_quantity, 0) AS pending_quantity
+        FROM gas_items g
+        LEFT JOIN day_movements dm ON dm.item_id = g.id
+        LEFT JOIN pending_returns pr ON pr.item_id = g.id
+        WHERE g.active = TRUE OR dm.id IS NOT NULL OR pr.pending_quantity IS NOT NULL
+        GROUP BY g.id, g.name, g.operation, g.stock, pr.pending_quantity
+        ORDER BY g.price DESC, g.id ASC
+    `, [businessDate, nextBusinessDate, session.session_id]);
+
+    const topupResult = await client.query(`
+        SELECT
+            provider,
+            COUNT(*)::int AS order_count,
+            COALESCE(SUM(amount), 0) AS total,
+            COALESCE(SUM(CASE WHEN paid THEN amount ELSE 0 END), 0) AS paid_total,
+            COALESCE(SUM(CASE WHEN NOT paid THEN amount ELSE 0 END), 0) AS unpaid_total,
+            COALESCE(SUM(CASE WHEN topped_up THEN 1 ELSE 0 END), 0)::int AS topped_up_count,
+            COALESCE(SUM(CASE WHEN paid THEN 1 ELSE 0 END), 0)::int AS paid_count
+        FROM mobile_topup_orders
+        WHERE session_id = $1
+          AND status <> 'CANCELLED'
+        GROUP BY provider
+        ORDER BY provider ASC
+    `, [session.session_id]);
+
+    const stockMovementResult = await client.query(`
+        SELECT
+            item_type,
+            item_name,
+            COALESCE(SUM(delta), 0) AS net_delta,
+            COUNT(*)::int AS movement_count
+        FROM inventory_movements
+        WHERE created_at >= ($1::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+          AND created_at < ($2::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+        GROUP BY item_type, item_name
+        ORDER BY item_type ASC, item_name ASC
+        LIMIT 160
+    `, [businessDate, nextBusinessDate]);
+
+    const lowStockResult = await client.query(`
+        SELECT p.id, p.barcode, p.name, p.price, p.cost, p.stock, p.category_id, p.min_stock, p.unit, p.active, c.name AS category
+        FROM products p
+        LEFT JOIN categories c ON c.id = p.category_id
+        WHERE p.active = TRUE
+          AND p.stock <= p.min_stock
+        ORDER BY p.stock ASC, p.name ASC
+        LIMIT 80
+    `);
+
+    const gasPendingQuantity = gasPendingResult.rows.reduce((sum, row) => sum + Number(row.quantity), 0);
+    const gasSoldQuantity = gasItemsResult.rows.reduce((sum, row) => sum + Number(row.quantity), 0);
+    const topupTotal = topupResult.rows.reduce((sum, row) => sum + Number(row.total), 0);
+    const topupCount = topupResult.rows.reduce((sum, row) => sum + Number(row.order_count), 0);
+    const checks = await getClosingChecks(session.session_id, client);
+    const readyToClose = isOpenSessionStatus(session.status) && checks.every((check) => check.confirmed);
+
+    return {
+        session,
+        previousClosedSession: await getPreviousClosedSession(businessDate, client),
+        checks,
+        readyToClose,
+        sections: {
+            pos: {
+                billCount: Number(posTotalsResult.rows[0].bill_count),
+                itemCount: posItemsResult.rows.reduce((sum, row) => sum + Number(row.quantity), 0),
+                subtotal: Number(posTotalsResult.rows[0].subtotal),
+                discount: Number(posTotalsResult.rows[0].discount),
+                total: Number(posTotalsResult.rows[0].total),
+                items: posItemsResult.rows.map((row) => ({
+                    name: row.name,
+                    barcode: row.barcode,
+                    quantity: Number(row.quantity),
+                    total: Number(row.total),
+                })),
+            },
+            gas: {
+                jobCount: Number(gasTotalsResult.rows[0].job_count),
+                soldQuantity: gasSoldQuantity,
+                returnedQuantity: Number(gasTotalsResult.rows[0].returned_tank_quantity),
+                pendingReturnQuantity: gasPendingQuantity,
+                total: Number(gasTotalsResult.rows[0].total),
+                deliveryFeeTotal: Number(gasTotalsResult.rows[0].delivery_fee_total),
+                items: gasItemsResult.rows.map((row) => ({
+                    id: row.id,
+                    name: row.name,
+                    operation: row.operation,
+                    quantity: Number(row.quantity),
+                    total: Number(row.total),
+                })),
+                pendingReturns: gasPendingResult.rows.map((row) => ({
+                    id: row.id,
+                    tankName: row.tank_name,
+                    quantity: Number(row.quantity),
+                })),
+                tankBalance: gasBalanceResult.rows.map((row) => {
+                    const stock = Number(row.stock);
+                    const movementDelta = Number(row.movement_delta);
+                    const adjustedQuantity = Number(row.adjusted_quantity);
+                    const openingStock = stock - movementDelta;
+                    const idealStock = openingStock + adjustedQuantity;
+                    const expectedMissing = idealStock - stock;
+                    const pendingQuantity = Number(row.pending_quantity);
+                    const status = expectedMissing <= 0
+                        ? 'BALANCED'
+                        : pendingQuantity === expectedMissing
+                            ? 'PENDING_RETURN'
+                            : 'MISMATCH';
+                    return {
+                        id: row.id,
+                        name: row.name,
+                        operation: row.operation,
+                        openingStock,
+                        currentStock: stock,
+                        soldQuantity: Number(row.sold_quantity),
+                        returnedQuantity: Number(row.returned_quantity),
+                        adjustedQuantity,
+                        pendingQuantity,
+                        expectedMissing,
+                        status,
+                    };
+                }),
+            },
+            lottery: {
+                billCount: Number(lotteryTotalsResult.rows[0].bill_count),
+                ticketCount: lotteryItemsResult.rows.reduce((sum, row) => sum + Number(row.quantity), 0),
+                total: Number(lotteryTotalsResult.rows[0].total),
+                items: lotteryItemsResult.rows.map((row) => ({
+                    number: row.number,
+                    quantity: Number(row.quantity),
+                    total: Number(row.total),
+                })),
+            },
+            topup: {
+                orderCount: topupCount,
+                total: topupTotal,
+                providers: topupResult.rows.map((row) => ({
+                    provider: row.provider,
+                    orderCount: Number(row.order_count),
+                    total: Number(row.total),
+                    paidTotal: Number(row.paid_total),
+                    unpaidTotal: Number(row.unpaid_total),
+                    toppedUpCount: Number(row.topped_up_count),
+                    paidCount: Number(row.paid_count),
+                })),
+            },
+            stock: {
+                movementCount: stockMovementResult.rows.reduce((sum, row) => sum + Number(row.movement_count), 0),
+                movements: stockMovementResult.rows.map((row) => ({
+                    itemType: row.item_type,
+                    itemName: row.item_name,
+                    netDelta: Number(row.net_delta),
+                    movementCount: Number(row.movement_count),
+                })),
+                lowProducts: lowStockResult.rows.map(mapProduct),
+            },
+        },
+    };
+}
+
 async function insertSaleRecord(client, sessionId, sale) {
     await client.query(`
         INSERT INTO sales_records (
@@ -489,6 +1594,52 @@ async function getCartItems(sessionId, client = pool) {
 
 async function getCartResponse(sessionId, client = pool) {
     const items = await getCartItems(sessionId, client);
+    return { session_id: sessionId, items };
+}
+
+async function ensureLotteryCartSession(sessionId, client = pool) {
+    const session = await ensureAppSession(sessionId, client);
+    const normalizedSessionId = session.session_id;
+
+    await client.query(`
+        INSERT INTO lottery_cart_sessions (session_id)
+        VALUES ($1)
+        ON CONFLICT (session_id)
+        DO UPDATE SET updated_at = NOW()
+    `, [normalizedSessionId]);
+
+    return normalizedSessionId;
+}
+
+async function getLotteryCartItems(sessionId, client = pool) {
+    const result = await client.query(`
+        SELECT
+            ticket_id,
+            number,
+            series,
+            price,
+            quantity
+        FROM lottery_cart_items
+        WHERE session_id = $1
+        ORDER BY id ASC
+    `, [sessionId]);
+
+    return result.rows.map((item) => ({
+        id: String(item.ticket_id),
+        ticketId: Number(item.ticket_id),
+        name: `Lottery ${item.number}`,
+        barcode: item.number,
+        number: item.number,
+        series: item.series,
+        price: Number(item.price),
+        quantity: Number(item.quantity),
+        discount: 0,
+        item_type: 'LOTTERY',
+    }));
+}
+
+async function getLotteryCartResponse(sessionId, client = pool) {
+    const items = await getLotteryCartItems(sessionId, client);
     return { session_id: sessionId, items };
 }
 
@@ -577,13 +1728,663 @@ async function getGasState(sessionId, client = pool) {
     };
 }
 
+app.post('/api/auth/login', async (req, res) => {
+    const username = String(req.body.username || '').trim();
+    const password = String(req.body.password || '');
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'username and password are required' });
+    }
+
+    try {
+        const result = await pool.query(`
+            SELECT *
+            FROM app_users
+            WHERE username = $1 AND active = TRUE
+            LIMIT 1
+        `, [username]);
+        const user = result.rows[0];
+
+        if (!user || !verifyPassword(password, user)) {
+            return res.status(401).json({ error: 'Invalid username or password' });
+        }
+
+        const token = crypto.randomBytes(32).toString('hex');
+        const expiresAt = new Date(Date.now() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
+
+        await pool.query(`
+            INSERT INTO app_user_sessions (token_hash, user_id, expires_at)
+            VALUES ($1, $2, $3)
+        `, [sha256(token), user.id, expiresAt]);
+
+        res.json({
+            token,
+            expiresAt,
+            user: sanitizeUser(user),
+        });
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+app.use('/api', requireAuth);
+
+app.get('/api/auth/me', (req, res) => {
+    res.json({ user: req.user });
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+    const authorization = String(req.headers.authorization || '');
+    const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+    if (token) {
+        await pool.query('DELETE FROM app_user_sessions WHERE token_hash = $1', [sha256(token)]);
+    }
+    res.json({ ok: true });
+});
+
+app.get('/api/users', requireOwner, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT id, username, display_name, role, active, created_at, updated_at
+            FROM app_users
+            ORDER BY id ASC
+        `);
+        res.json(result.rows.map(sanitizeUser));
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+app.post('/api/users', requireOwner, async (req, res) => {
+    const username = String(req.body.username || '').trim();
+    const displayName = String(req.body.displayName || req.body.display_name || '').trim();
+    const password = String(req.body.password || '');
+    const role = String(req.body.role || USER_ROLE).trim();
+
+    if (!username || !displayName || password.length < 6 || !USER_ROLES.has(role)) {
+        return res.status(400).json({ error: 'username, displayName, password >= 6, and valid role are required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { salt, hash } = hashPassword(password);
+        const result = await client.query(`
+            INSERT INTO app_users (username, display_name, password_hash, password_salt, role, active)
+            VALUES ($1, $2, $3, $4, $5, TRUE)
+            RETURNING id, username, display_name, role, active, created_at, updated_at
+        `, [username, displayName, hash, salt, role]);
+        await logAudit(client, req, 'CREATE', 'USER', result.rows[0].id, 'create user', null, sanitizeUser(result.rows[0]));
+        await client.query('COMMIT');
+        res.status(201).json(sanitizeUser(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'username already exists' });
+        }
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/users/:userId', requireOwner, async (req, res) => {
+    const userId = Number(req.params.userId);
+    const username = req.body.username === undefined ? undefined : String(req.body.username || '').trim();
+    const displayName = req.body.displayName === undefined && req.body.display_name === undefined
+        ? undefined
+        : String(req.body.displayName || req.body.display_name || '').trim();
+    const role = req.body.role === undefined ? undefined : String(req.body.role || '').trim();
+    const active = req.body.active === undefined ? undefined : Boolean(req.body.active);
+    const password = req.body.password === undefined ? undefined : String(req.body.password || '');
+
+    if (!Number.isInteger(userId)) {
+        return res.status(400).json({ error: 'valid user id is required' });
+    }
+
+    if (role !== undefined && !USER_ROLES.has(role)) {
+        return res.status(400).json({ error: 'valid role is required' });
+    }
+
+    if (password !== undefined && password.length < 6) {
+        return res.status(400).json({ error: 'password must be at least 6 characters' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, username, display_name, role, active, created_at, updated_at FROM app_users WHERE id = $1 FOR UPDATE', [userId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'user not found' });
+        }
+
+        const updates = [];
+        const values = [userId];
+        if (username !== undefined) {
+            values.push(username);
+            updates.push(`username = $${values.length}`);
+        }
+        if (displayName !== undefined) {
+            values.push(displayName);
+            updates.push(`display_name = $${values.length}`);
+        }
+        if (role !== undefined) {
+            values.push(role);
+            updates.push(`role = $${values.length}`);
+        }
+        if (active !== undefined) {
+            values.push(active);
+            updates.push(`active = $${values.length}`);
+        }
+        if (password !== undefined) {
+            const { salt, hash } = hashPassword(password);
+            values.push(hash);
+            updates.push(`password_hash = $${values.length}`);
+            values.push(salt);
+            updates.push(`password_salt = $${values.length}`);
+        }
+
+        if (updates.length === 0) {
+            await client.query('ROLLBACK');
+            return res.json(sanitizeUser(before.rows[0]));
+        }
+
+        const result = await client.query(`
+            UPDATE app_users
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, username, display_name, role, active, created_at, updated_at
+        `, values);
+        await logAudit(client, req, 'UPDATE', 'USER', userId, req.body.reason || 'update user', sanitizeUser(before.rows[0]), sanitizeUser(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(sanitizeUser(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'username already exists' });
+        }
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/users/:userId', requireOwner, async (req, res) => {
+    const userId = Number(req.params.userId);
+    if (userId === req.user.id) {
+        return res.status(409).json({ error: 'cannot deactivate current owner session' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, username, display_name, role, active, created_at, updated_at FROM app_users WHERE id = $1 FOR UPDATE', [userId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'user not found' });
+        }
+
+        const result = await client.query(`
+            UPDATE app_users
+            SET active = FALSE, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, username, display_name, role, active, created_at, updated_at
+        `, [userId]);
+        await client.query('DELETE FROM app_user_sessions WHERE user_id = $1', [userId]);
+        await logAudit(client, req, 'DELETE', 'USER', userId, req.body.reason || 'deactivate user', sanitizeUser(before.rows[0]), sanitizeUser(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(sanitizeUser(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/staff', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT id, name, phone, role, active
+            FROM staff_members
+            ORDER BY active DESC, id ASC
+        `);
+        res.json(result.rows.map(mapStaff));
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+app.post('/api/staff', requireOwner, async (req, res) => {
+    const name = String(req.body.name || '').trim();
+    const phone = String(req.body.phone || '').trim();
+    const role = String(req.body.role || 'staff').trim();
+
+    if (!name) {
+        return res.status(400).json({ error: 'staff name is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const nextIdResult = await client.query(`
+            SELECT COALESCE(MAX(NULLIF(regexp_replace(id, '\\D', '', 'g'), '')::int), 0) + 1 AS next_id
+            FROM staff_members
+        `);
+        const id = `S-${String(nextIdResult.rows[0].next_id).padStart(3, '0')}`;
+        const result = await client.query(`
+            INSERT INTO staff_members (id, name, phone, role, active)
+            VALUES ($1, $2, $3, $4, TRUE)
+            RETURNING id, name, phone, role, active
+        `, [id, name, phone, role]);
+        await logAudit(client, req, 'CREATE', 'STAFF', id, 'create staff', null, mapStaff(result.rows[0]));
+        await client.query('COMMIT');
+        res.status(201).json(mapStaff(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/staff/:staffId', requireOwner, async (req, res) => {
+    const staffId = String(req.params.staffId || '').trim();
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, name, phone, role, active FROM staff_members WHERE id = $1 FOR UPDATE', [staffId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'staff not found' });
+        }
+
+        const updates = [];
+        const values = [staffId];
+        ['name', 'phone', 'role'].forEach((field) => {
+            if (req.body[field] !== undefined) {
+                values.push(String(req.body[field] || '').trim());
+                updates.push(`${field} = $${values.length}`);
+            }
+        });
+        if (req.body.active !== undefined) {
+            values.push(Boolean(req.body.active));
+            updates.push(`active = $${values.length}`);
+        }
+
+        if (updates.length === 0) {
+            await client.query('ROLLBACK');
+            return res.json(mapStaff(before.rows[0]));
+        }
+
+        const result = await client.query(`
+            UPDATE staff_members
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, name, phone, role, active
+        `, values);
+        await logAudit(client, req, 'UPDATE', 'STAFF', staffId, req.body.reason || 'update staff', mapStaff(before.rows[0]), mapStaff(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapStaff(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/staff/:staffId', requireOwner, async (req, res) => {
+    const staffId = String(req.params.staffId || '').trim();
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, name, phone, role, active FROM staff_members WHERE id = $1 FOR UPDATE', [staffId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'staff not found' });
+        }
+
+        const result = await client.query(`
+            UPDATE staff_members
+            SET active = FALSE, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, name, phone, role, active
+        `, [staffId]);
+        await logAudit(client, req, 'DELETE', 'STAFF', staffId, req.body.reason || 'deactivate staff', mapStaff(before.rows[0]), mapStaff(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapStaff(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/members', async (req, res) => {
+    try {
+        const phone = String(req.query.phone || '').replace(/\D/g, '');
+        const params = [];
+        let where = 'WHERE active = TRUE';
+        if (phone) {
+            params.push(phone);
+            where += ` AND phone = $${params.length}`;
+        }
+        const result = await pool.query(`
+            SELECT id, name, phone, note, active
+            FROM members
+            ${where}
+            ORDER BY id DESC
+            LIMIT 100
+        `, params);
+        res.json(result.rows.map(mapMember));
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+app.post('/api/members', requireOwner, async (req, res) => {
+    const name = String(req.body.name || '').trim();
+    const phone = String(req.body.phone || '').replace(/\D/g, '');
+    const note = String(req.body.note || '').trim();
+    if (!name || !/^0\d{9}$/.test(phone)) {
+        return res.status(400).json({ error: 'member name and 10 digit phone are required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const result = await client.query(`
+            INSERT INTO members (name, phone, note, active)
+            VALUES ($1, $2, $3, TRUE)
+            ON CONFLICT (phone)
+            DO UPDATE SET name = EXCLUDED.name, note = EXCLUDED.note, active = TRUE, updated_at = NOW()
+            RETURNING id, name, phone, note, active
+        `, [name, phone, note]);
+        await logAudit(client, req, 'UPSERT', 'MEMBER', result.rows[0].id, 'upsert member', null, mapMember(result.rows[0]));
+        await client.query('COMMIT');
+        res.status(201).json(mapMember(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/members/:memberId', requireOwner, async (req, res) => {
+    const memberId = Number(req.params.memberId);
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, name, phone, note, active FROM members WHERE id = $1 FOR UPDATE', [memberId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'member not found' });
+        }
+
+        const updates = [];
+        const values = [memberId];
+        ['name', 'note'].forEach((field) => {
+            if (req.body[field] !== undefined) {
+                values.push(String(req.body[field] || '').trim());
+                updates.push(`${field} = $${values.length}`);
+            }
+        });
+        if (req.body.phone !== undefined) {
+            values.push(String(req.body.phone || '').replace(/\D/g, ''));
+            updates.push(`phone = $${values.length}`);
+        }
+        if (req.body.active !== undefined) {
+            values.push(Boolean(req.body.active));
+            updates.push(`active = $${values.length}`);
+        }
+
+        if (updates.length === 0) {
+            await client.query('ROLLBACK');
+            return res.json(mapMember(before.rows[0]));
+        }
+
+        const result = await client.query(`
+            UPDATE members
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, name, phone, note, active
+        `, values);
+        await logAudit(client, req, 'UPDATE', 'MEMBER', memberId, req.body.reason || 'update member', mapMember(before.rows[0]), mapMember(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapMember(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'phone already exists' });
+        }
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/members/:memberId', requireOwner, async (req, res) => {
+    const memberId = Number(req.params.memberId);
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, name, phone, note, active FROM members WHERE id = $1 FOR UPDATE', [memberId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'member not found' });
+        }
+
+        const result = await client.query(`
+            UPDATE members
+            SET active = FALSE, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, name, phone, note, active
+        `, [memberId]);
+        await logAudit(client, req, 'DELETE', 'MEMBER', memberId, req.body.reason || 'deactivate member', mapMember(before.rows[0]), mapMember(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapMember(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
 app.get('/api/app-sessions/today', async (req, res) => {
     try {
         const session = await ensureAppSession(dailySessionId());
-        res.json(session);
+        res.json({
+            ...session,
+            previousClosedSession: await getPreviousClosedSession(session.business_date),
+        });
     } catch (err) {
         console.error(err.message);
         res.status(err.statusCode || 500).json({ error: err.message || "Database error" });
+    }
+});
+
+app.get('/api/app-sessions/:sessionId/closing-summary', requireOwner, async (req, res) => {
+    try {
+        res.json(await getClosingSummary(req.params.sessionId));
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || "Database error" });
+    }
+});
+
+app.patch('/api/app-sessions/:sessionId/closing-checks/:section', requireOwner, async (req, res) => {
+    const section = String(req.params.section || '').trim().toUpperCase();
+    if (!CLOSING_SECTIONS.includes(section)) {
+        return res.status(400).json({ error: 'valid closing section is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureAppSession(req.params.sessionId, client);
+        if (!isOpenSessionStatus(session.status)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: session.status === SESSION_CLOSED ? 'shop is closed' : 'shop is not open' });
+        }
+
+        const confirmed = req.body.confirmed !== false;
+        const note = String(req.body.note || '').trim();
+        await client.query(`
+            INSERT INTO app_session_closing_checks (session_id, section, confirmed, confirmed_by, confirmed_at, note, updated_at)
+            VALUES ($1, $2, $3, $4, CASE WHEN $3 THEN NOW() ELSE NULL END, $5, NOW())
+            ON CONFLICT (session_id, section)
+            DO UPDATE SET
+                confirmed = EXCLUDED.confirmed,
+                confirmed_by = EXCLUDED.confirmed_by,
+                confirmed_at = EXCLUDED.confirmed_at,
+                note = EXCLUDED.note,
+                updated_at = NOW()
+        `, [session.session_id, section, confirmed, req.user.id, note || null]);
+        await logAudit(client, req, confirmed ? 'CONFIRM' : 'UNCONFIRM', 'CLOSING_CHECK', `${session.session_id}:${section}`, note || 'closing check', null, { section, confirmed });
+        const summary = await getClosingSummary(session.session_id, client);
+        await client.query('COMMIT');
+        res.json(summary);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/app-sessions/:sessionId/open', requireOwner, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureAppSession(req.params.sessionId, client);
+        if (session.status === SESSION_CLOSED) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'closed session cannot be reopened' });
+        }
+
+        const result = await client.query(`
+            UPDATE app_sessions
+            SET status = $1,
+                opened_at = COALESCE(opened_at, NOW()),
+                opened_by = COALESCE(opened_by, $2),
+                updated_at = NOW()
+            WHERE session_id = $3
+            RETURNING session_id, business_date, status, opened_at, opened_by, closed_at, closed_by
+        `, [SESSION_OPEN, req.user.id, session.session_id]);
+        const openedSession = mapAppSession(result.rows[0]);
+        const previousClosedSession = await getPreviousClosedSession(openedSession.business_date, client);
+        await logAudit(client, req, 'OPEN', 'APP_SESSION', session.session_id, req.body.reason || 'open shop', session, openedSession);
+        await client.query('COMMIT');
+        res.json({
+            ...openedSession,
+            previousClosedSession,
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/app-sessions/:sessionId/reopen', requireOwner, async (req, res) => {
+    const reason = String(req.body.reason || '').trim();
+    if (!reason) {
+        return res.status(400).json({ error: 'reopen reason is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureAppSession(req.params.sessionId, client);
+        if (session.status !== SESSION_CLOSED) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'only closed sessions can be reopened' });
+        }
+
+        await client.query('DELETE FROM app_session_closing_checks WHERE session_id = $1', [session.session_id]);
+        const result = await client.query(`
+            UPDATE app_sessions
+            SET status = $1,
+                closed_at = NULL,
+                closed_by = NULL,
+                updated_at = NOW()
+            WHERE session_id = $2
+            RETURNING session_id, business_date, status, opened_at, opened_by, closed_at, closed_by
+        `, [SESSION_OPEN, session.session_id]);
+        const reopenedSession = mapAppSession(result.rows[0]);
+        await logAudit(client, req, 'REOPEN', 'APP_SESSION', session.session_id, reason, session, reopenedSession);
+        const summary = await getClosingSummary(session.session_id, client);
+        await client.query('COMMIT');
+        res.json(summary);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/app-sessions/:sessionId/close', requireOwner, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureAppSession(req.params.sessionId, client);
+        if (session.status === SESSION_CLOSED) {
+            await client.query('ROLLBACK');
+            return res.json(await getClosingSummary(session.session_id));
+        }
+        if (!isOpenSessionStatus(session.status)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'shop is not open' });
+        }
+
+        const summary = await getClosingSummary(session.session_id, client);
+        if (!summary.checks.every((check) => check.confirmed)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'all closing sections must be confirmed', summary });
+        }
+
+        const result = await client.query(`
+            UPDATE app_sessions
+            SET status = $1,
+                closed_at = NOW(),
+                closed_by = $2,
+                updated_at = NOW()
+            WHERE session_id = $3
+            RETURNING session_id, business_date, status, opened_at, opened_by, closed_at, closed_by
+        `, [SESSION_CLOSED, req.user.id, session.session_id]);
+        await logAudit(client, req, 'CLOSE', 'APP_SESSION', session.session_id, req.body.reason || 'close shop', session, mapAppSession(result.rows[0]));
+        const closedSummary = await getClosingSummary(session.session_id, client);
+        await client.query('COMMIT');
+        res.json(closedSummary);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || "Database error" });
+    } finally {
+        client.release();
     }
 });
 
@@ -592,7 +2393,7 @@ app.get('/api/analytics/sales', async (req, res) => {
         const range = resolveAnalyticsRange(req.query);
         res.json({
             ...range,
-            sales: await getSalesRecordsByDateRange(range.startDate, range.endDate),
+            sales: await getCombinedSaleRecordsByDateRange(range.startDate, range.endDate),
         });
     } catch (err) {
         console.error(err.message);
@@ -603,18 +2404,18 @@ app.get('/api/analytics/sales', async (req, res) => {
 app.get('/api/app-sessions/:sessionId/sales', async (req, res) => {
     try {
         const session = await ensureAppSession(req.params.sessionId);
-        res.json(await getSalesRecords(session.session_id));
+        res.json(await getCombinedSaleRecords(session.session_id));
     } catch (err) {
         console.error(err.message);
         res.status(err.statusCode || 500).json({ error: err.message || "Database error" });
     }
 });
 
-app.post('/api/app-sessions/:sessionId/sales', async (req, res) => {
+app.post('/api/app-sessions/:sessionId/sales', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const session = await ensureAppSession(req.params.sessionId, client);
+        const session = await ensureOpenAppSession(req.params.sessionId, client);
         const sale = req.body;
 
         if (!sale?.id || !sale?.channel || !Array.isArray(sale.items)) {
@@ -632,6 +2433,176 @@ app.post('/api/app-sessions/:sessionId/sales', async (req, res) => {
         await client.query('ROLLBACK');
         console.error(err.message);
         res.status(500).json({ error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/app-sessions/:sessionId/sales/:saleId', requireOwner, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureAppSession(req.params.sessionId, client);
+        const before = await client.query('SELECT * FROM sales_records WHERE id = $1 AND session_id = $2 FOR UPDATE', [
+            req.params.saleId,
+            session.session_id,
+        ]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'sale not found' });
+        }
+
+        const updates = [];
+        const values = [req.params.saleId, session.session_id];
+        const stringFields = [
+            ['customerName', 'customer_name'],
+            ['staffName', 'staff_name'],
+            ['paymentMethod', 'payment_method'],
+            ['status', 'status'],
+            ['note', 'note'],
+        ];
+        stringFields.forEach(([bodyField, column]) => {
+            if (req.body[bodyField] !== undefined) {
+                values.push(String(req.body[bodyField] || '').trim());
+                updates.push(`${column} = $${values.length}`);
+            }
+        });
+        const numberFields = [
+            ['subtotal', 'subtotal'],
+            ['discount', 'discount'],
+            ['total', 'total'],
+            ['cashReceived', 'cash_received'],
+            ['change', 'change'],
+        ];
+        numberFields.forEach(([bodyField, column]) => {
+            if (req.body[bodyField] !== undefined) {
+                values.push(Number(req.body[bodyField]));
+                updates.push(`${column} = $${values.length}`);
+            }
+        });
+
+        if (updates.length === 0) {
+            await client.query('ROLLBACK');
+            return res.json(mapSaleRecord(before.rows[0]));
+        }
+
+        const result = await client.query(`
+            UPDATE sales_records
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id = $1 AND session_id = $2
+            RETURNING *
+        `, values);
+        await logAudit(client, req, 'UPDATE', 'SALE', req.params.saleId, req.body.reason || 'update sale', mapSaleRecord(before.rows[0]), mapSaleRecord(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapSaleRecord(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/app-sessions/:sessionId/sales/:saleId/cancel', requireOwner, async (req, res) => {
+    const reason = String(req.body.reason || '').trim();
+    if (!reason) {
+        return res.status(400).json({ error: 'cancel reason is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureAppSession(req.params.sessionId, client);
+        const saleResult = await client.query('SELECT * FROM sales_records WHERE id = $1 AND session_id = $2 FOR UPDATE', [
+            req.params.saleId,
+            session.session_id,
+        ]);
+        const sale = saleResult.rows[0];
+        if (!sale) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'sale not found' });
+        }
+        if (sale.status === 'CANCELLED') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'sale already cancelled' });
+        }
+
+        const sourceType = sale.channel === 'GAS'
+            ? 'GAS_JOB'
+            : sale.channel === 'LOTTERY'
+                ? 'LOTTERY_SALE'
+                : 'POS_SALE';
+        const reversedCount = await reverseInventoryMovements(client, req, sourceType, req.params.saleId, reason);
+
+        if (reversedCount === 0 && Array.isArray(sale.items)) {
+            for (const item of sale.items) {
+                const quantity = Math.max(0, Math.floor(Number(item.quantity || 0)));
+                if (quantity <= 0) {
+                    continue;
+                }
+
+                if (sale.channel === 'POS') {
+                    const productId = Number(item.productId || item.id || 0);
+                    if (Number.isInteger(productId) && productId > 0) {
+                        await adjustProductStock(client, req, productId, quantity, reason, 'POS_SALE_REVERSAL', req.params.saleId);
+                    } else if (item.barcode) {
+                        const productResult = await client.query('SELECT id FROM products WHERE barcode = $1 LIMIT 1', [item.barcode]);
+                        if (productResult.rows[0]) {
+                            await adjustProductStock(client, req, productResult.rows[0].id, quantity, reason, 'POS_SALE_REVERSAL', req.params.saleId);
+                        }
+                    }
+                }
+
+                if (sale.channel === 'LOTTERY') {
+                    const ticketId = Number(item.ticketId || item.id || 0);
+                    if (Number.isInteger(ticketId) && ticketId > 0) {
+                        await adjustLotteryStock(client, req, ticketId, quantity, reason, 'LOTTERY_SALE_REVERSAL', req.params.saleId);
+                    } else if (item.number || item.barcode) {
+                        const ticketResult = await client.query('SELECT id FROM lottery_tickets WHERE number = $1 LIMIT 1', [
+                            item.number || item.barcode,
+                        ]);
+                        if (ticketResult.rows[0]) {
+                            await adjustLotteryStock(client, req, ticketResult.rows[0].id, quantity, reason, 'LOTTERY_SALE_REVERSAL', req.params.saleId);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (sale.channel === 'GAS') {
+            await client.query(`
+                UPDATE gas_jobs
+                SET status = 'CANCELLED',
+                    cancel_reason = $1,
+                    cancelled_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = $2 AND session_id = $3
+            `, [reason, req.params.saleId, session.session_id]);
+            await client.query(`
+                UPDATE gas_returns
+                SET status = 'CANCELLED', cancelled_at = NOW()
+                WHERE job_id = $1 AND session_id = $2 AND status = 'PENDING'
+            `, [req.params.saleId, session.session_id]);
+        }
+
+        const result = await client.query(`
+            UPDATE sales_records
+            SET status = 'CANCELLED',
+                cancel_reason = $1,
+                cancelled_at = NOW(),
+                cancelled_by = $2,
+                updated_at = NOW()
+            WHERE id = $3 AND session_id = $4
+            RETURNING *
+        `, [reason, req.user.id, req.params.saleId, session.session_id]);
+        await logAudit(client, req, 'CANCEL', 'SALE', req.params.saleId, reason, mapSaleRecord(sale), mapSaleRecord(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapSaleRecord(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
     } finally {
         client.release();
     }
@@ -697,6 +2668,8 @@ app.post('/api/app-sessions/:sessionId/pos/checkout', async (req, res) => {
         const billDiscount = Math.max(0, Number(req.body.billDiscount || 0));
         const subtotal = cart.reduce((sum, item) => sum + item.price * item.quantity - item.discount, 0);
         const total = Math.max(0, subtotal - billDiscount);
+        const createdAt = new Date();
+        const saleId = createSaleId('POS', createdAt);
         const paymentMethod = req.body.paymentMethod || 'เงินสด';
         const cashReceived = paymentMethod === 'เงินสด' ? Number(req.body.cashReceived || 0) : total;
 
@@ -717,12 +2690,19 @@ app.post('/api/app-sessions/:sessionId/pos/checkout', async (req, res) => {
                 return res.status(409).json({ error: "Stock is not enough", item });
             }
 
-            await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, Number(item.id)]);
+            await adjustProductStock(
+                client,
+                req,
+                Number(item.id),
+                -item.quantity,
+                `POS checkout ${sessionId}`,
+                'POS_SALE',
+                saleId,
+            );
         }
 
-        const createdAt = new Date();
         const receipt = {
-            id: createSaleId('POS', createdAt),
+            id: saleId,
             createdAt: createdAt.toISOString(),
             cashierName: req.body.cashierName || 'ไม่ระบุพนักงาน',
             customerName: req.body.customerName || 'ลูกค้าทั่วไป',
@@ -743,6 +2723,8 @@ app.post('/api/app-sessions/:sessionId/pos/checkout', async (req, res) => {
             paymentMethod,
             status: 'สำเร็จ',
             items: cart.map((item) => ({
+                id: item.id,
+                productId: item.id,
                 name: item.name,
                 barcode: item.barcode,
                 quantity: item.quantity,
@@ -798,6 +2780,7 @@ app.post('/api/app-sessions/:sessionId/pos/checkout', async (req, res) => {
 
 app.get('/api/products', async (req, res) => {
     try {
+        const includeInactive = req.user?.role === OWNER_ROLE && String(req.query.includeInactive || '') === 'true';
         const result = await pool.query(`
             SELECT
                 p.id,
@@ -807,58 +2790,82 @@ app.get('/api/products', async (req, res) => {
                 p.cost,
                 p.stock,
                 p.category_id,
+                p.min_stock,
+                p.unit,
+                p.active,
                 c.name AS category
             FROM products p
             LEFT JOIN categories c ON c.id = p.category_id
+            WHERE ($1::boolean = TRUE OR p.active = TRUE)
             ORDER BY p.id ASC
-        `);
-        res.json(result.rows);
+        `, [includeInactive]);
+        res.json(result.rows.map(mapProduct));
     } catch (err) {
         console.error(err.message);
         res.status(500).json({ error: "Database error" });
     }
 });
 
-app.post('/api/products', async (req, res) => {
-    const { barcode, name, price, cost, stock, category } = req.body;
+app.post('/api/products', requireOwner, async (req, res) => {
+    const barcode = String(req.body.barcode || '').trim();
+    const name = String(req.body.name || '').trim();
+    const price = Number(req.body.price);
+    const cost = Number(req.body.cost || req.body.price || 0);
+    const stock = Math.max(0, Math.floor(Number(req.body.stock || 0)));
+    const category = String(req.body.category || '').trim();
+    const minStock = Math.max(0, Math.floor(Number(req.body.minStock || req.body.min_stock || 5)));
+    const unit = String(req.body.unit || 'piece').trim() || 'piece';
 
-    if (!barcode || !name || Number(price) <= 0) {
+    if (!barcode || !name || !Number.isFinite(price) || price <= 0) {
         return res.status(400).json({ error: "barcode, name, and price are required" });
     }
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const existingProduct = await client.query('SELECT id FROM products WHERE barcode = $1 LIMIT 1', [barcode]);
-        if (existingProduct.rows[0]) {
+        const existingProduct = await client.query('SELECT id, active FROM products WHERE barcode = $1 LIMIT 1', [barcode]);
+        if (existingProduct.rows[0]?.active) {
             await client.query('ROLLBACK');
             return res.status(409).json({ error: "Barcode already exists" });
         }
 
         let categoryId = null;
-
         if (category) {
             categoryId = await ensureCategory(category, client);
         }
 
-        const productResult = await client.query(
-            `
-            INSERT INTO products (barcode, name, price, cost, stock, category_id)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, barcode, name, price, cost, stock, category_id
-            `,
-            [
-                barcode,
-                name,
-                Number(price),
-                Number(cost || price),
-                Number(stock || 0),
-                categoryId,
-            ],
-        );
+        const productResult = await client.query(`
+            INSERT INTO products (barcode, name, price, cost, stock, category_id, min_stock, unit, active)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
+            ON CONFLICT (barcode)
+            DO UPDATE SET
+                name = EXCLUDED.name,
+                price = EXCLUDED.price,
+                cost = EXCLUDED.cost,
+                stock = EXCLUDED.stock,
+                category_id = EXCLUDED.category_id,
+                min_stock = EXCLUDED.min_stock,
+                unit = EXCLUDED.unit,
+                active = TRUE,
+                updated_at = NOW()
+            RETURNING id, barcode, name, price, cost, stock, category_id, min_stock, unit, active
+        `, [barcode, name, price, cost, stock, categoryId, minStock, unit]);
+        const product = { ...productResult.rows[0], category: category || null };
 
+        if (stock > 0) {
+            await recordInventoryMovement(client, req, {
+                itemType: 'PRODUCT',
+                itemId: product.id,
+                itemName: product.name,
+                delta: stock,
+                reason: req.body.reason || 'initial product stock',
+                sourceType: 'PRODUCT_CREATE',
+                sourceId: product.id,
+            });
+        }
+        await logAudit(client, req, 'UPSERT', 'PRODUCT', product.id, req.body.reason || 'upsert product', null, mapProduct(product));
         await client.query('COMMIT');
-        res.status(201).json({ ...productResult.rows[0], category: category || null });
+        res.status(201).json(mapProduct(product));
     } catch (err) {
         await client.query('ROLLBACK');
         if (err.code === '23505') {
@@ -871,28 +2878,178 @@ app.post('/api/products', async (req, res) => {
     }
 });
 
-app.patch('/api/products/:productId/stock', async (req, res) => {
+app.patch('/api/products/:productId', requireOwner, async (req, res) => {
     const productId = Number(req.params.productId);
-    const delta = Number(req.body.delta);
-
-    if (!Number.isInteger(productId) || !Number.isFinite(delta) || delta === 0) {
-        return res.status(400).json({ error: "product id and non-zero delta are required" });
+    if (!Number.isInteger(productId)) {
+        return res.status(400).json({ error: "valid product id is required" });
     }
 
+    const client = await pool.connect();
     try {
-        const result = await pool.query(`
-            UPDATE products
-            SET stock = GREATEST(0, COALESCE(stock, 0) + $1)
-            WHERE id = $2
-            RETURNING id, barcode, name, price, cost, stock, category_id
-        `, [Math.floor(delta), productId]);
-
-        if (!result.rows[0]) {
+        await client.query('BEGIN');
+        const before = await client.query(`
+            SELECT p.*, c.name AS category
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.id = $1
+            FOR UPDATE OF p
+        `, [productId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
             return res.status(404).json({ error: "product not found" });
         }
 
-        const categoryResult = await pool.query('SELECT name FROM categories WHERE id = $1', [result.rows[0].category_id]);
-        res.json({ ...result.rows[0], category: categoryResult.rows[0]?.name ?? null });
+        const updates = [];
+        const values = [productId];
+        ['barcode', 'name', 'unit'].forEach((field) => {
+            if (req.body[field] !== undefined) {
+                values.push(String(req.body[field] || '').trim());
+                updates.push(`${field} = $${values.length}`);
+            }
+        });
+        ['price', 'cost'].forEach((field) => {
+            if (req.body[field] !== undefined) {
+                values.push(Number(req.body[field]));
+                updates.push(`${field} = $${values.length}`);
+            }
+        });
+        if (req.body.minStock !== undefined || req.body.min_stock !== undefined) {
+            values.push(Math.max(0, Math.floor(Number(req.body.minStock || req.body.min_stock || 0))));
+            updates.push(`min_stock = $${values.length}`);
+        }
+        if (req.body.category !== undefined) {
+            const categoryName = String(req.body.category || '').trim();
+            const categoryId = categoryName ? await ensureCategory(categoryName, client) : null;
+            values.push(categoryId);
+            updates.push(`category_id = $${values.length}`);
+        }
+        if (req.body.active !== undefined) {
+            values.push(Boolean(req.body.active));
+            updates.push(`active = $${values.length}`);
+        }
+
+        if (updates.length === 0) {
+            await client.query('ROLLBACK');
+            return res.json(mapProduct(before.rows[0]));
+        }
+
+        const result = await client.query(`
+            UPDATE products
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, barcode, name, price, cost, stock, category_id, min_stock, unit, active
+        `, values);
+        const categoryResult = await client.query('SELECT name FROM categories WHERE id = $1', [result.rows[0].category_id]);
+        const product = { ...result.rows[0], category: categoryResult.rows[0]?.name ?? null };
+        await logAudit(client, req, 'UPDATE', 'PRODUCT', productId, req.body.reason || 'update product', mapProduct(before.rows[0]), mapProduct(product));
+        await client.query('COMMIT');
+        res.json(mapProduct(product));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(409).json({ error: "Barcode already exists" });
+        }
+        console.error(err.message);
+        res.status(500).json({ error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/products/:productId', requireOwner, async (req, res) => {
+    const productId = Number(req.params.productId);
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query(`
+            SELECT p.*, c.name AS category
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.id = $1
+            FOR UPDATE OF p
+        `, [productId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "product not found" });
+        }
+
+        const result = await client.query(`
+            UPDATE products
+            SET active = FALSE, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, barcode, name, price, cost, stock, category_id, min_stock, unit, active
+        `, [productId]);
+        const product = { ...result.rows[0], category: before.rows[0].category };
+        await logAudit(client, req, 'DELETE', 'PRODUCT', productId, req.body.reason || 'deactivate product', mapProduct(before.rows[0]), mapProduct(product));
+        await client.query('COMMIT');
+        res.json(mapProduct(product));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/products/:productId/stock', requireOwner, async (req, res) => {
+    const productId = Number(req.params.productId);
+    const delta = Number(req.body.delta);
+    const reason = String(req.body.reason || '').trim();
+
+    if (!Number.isInteger(productId) || !Number.isFinite(delta) || delta === 0 || !reason) {
+        return res.status(400).json({ error: "product id, non-zero delta, and reason are required" });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await adjustProductStock(client, req, productId, Math.floor(delta), reason, 'STOCK_ADJUST', productId);
+        const result = await client.query(`
+            SELECT p.*, c.name AS category
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.id = $1
+        `, [productId]);
+        await logAudit(client, req, 'STOCK_ADJUST', 'PRODUCT', productId, reason, null, mapProduct(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapProduct(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/stock/movements', requireOwner, async (req, res) => {
+    try {
+        const date = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || ''))
+            ? String(req.query.date)
+            : null;
+        const params = [];
+        let where = '';
+        if (date) {
+            params.push(date);
+            params.push(addUtcDays(date, 1));
+            where = `
+                WHERE m.created_at >= ($1::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+                  AND m.created_at < ($2::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+            `;
+        }
+
+        const result = await pool.query(`
+            SELECT
+                m.*,
+                COALESCE(u.display_name, 'system') AS actor_name
+            FROM inventory_movements m
+            LEFT JOIN app_users u ON u.id = m.created_by
+            ${where}
+            ORDER BY m.created_at DESC
+            LIMIT 300
+        `, params);
+        res.json(result.rows.map(mapInventoryMovement));
     } catch (err) {
         console.error(err.message);
         res.status(500).json({ error: "Database error" });
@@ -901,16 +3058,183 @@ app.patch('/api/products/:productId/stock', async (req, res) => {
 
 app.get('/api/gas/items', async (req, res) => {
     try {
+        const includeInactive = req.user?.role === OWNER_ROLE && String(req.query.includeInactive || '') === 'true';
         const result = await pool.query(`
-            SELECT id, name, operation, price, stock, image_url
+            SELECT id, name, operation, price, stock, image_url, active
             FROM gas_items
-            WHERE active = TRUE
+            WHERE ($1::boolean = TRUE OR active = TRUE)
             ORDER BY price DESC, id ASC
-        `);
+        `, [includeInactive]);
         res.json(result.rows.map(mapGasItem));
     } catch (err) {
         console.error(err.message);
         res.status(500).json({ error: "Database error" });
+    }
+});
+
+app.post('/api/gas/items', requireOwner, async (req, res) => {
+    const id = String(req.body.id || '').trim().toUpperCase();
+    const name = String(req.body.name || '').trim();
+    const operation = String(req.body.operation || '').trim();
+    const price = Number(req.body.price);
+    const stock = Math.max(0, Math.floor(Number(req.body.stock || 0)));
+    const imageUrl = String(req.body.imageUrl || req.body.image_url || '').trim();
+
+    if (!id || !name || !operation || !Number.isFinite(price) || price <= 0) {
+        return res.status(400).json({ error: 'id, name, operation, and price are required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const result = await client.query(`
+            INSERT INTO gas_items (id, name, operation, price, stock, image_url, active)
+            VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+            ON CONFLICT (id)
+            DO UPDATE SET
+                name = EXCLUDED.name,
+                operation = EXCLUDED.operation,
+                price = EXCLUDED.price,
+                stock = EXCLUDED.stock,
+                image_url = EXCLUDED.image_url,
+                active = TRUE,
+                updated_at = NOW()
+            RETURNING id, name, operation, price, stock, image_url, active
+        `, [id, name, operation, price, stock, imageUrl || null]);
+        if (stock > 0) {
+            await recordInventoryMovement(client, req, {
+                itemType: 'GAS',
+                itemId: result.rows[0].id,
+                itemName: `${result.rows[0].name} ${result.rows[0].operation}`,
+                delta: stock,
+                reason: req.body.reason || 'initial gas stock',
+                sourceType: 'GAS_ITEM_CREATE',
+                sourceId: result.rows[0].id,
+            });
+        }
+        await logAudit(client, req, 'UPSERT', 'GAS_ITEM', id, req.body.reason || 'upsert gas item', null, mapGasItem(result.rows[0]));
+        await client.query('COMMIT');
+        res.status(201).json(mapGasItem(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/gas/items/:itemId', requireOwner, async (req, res) => {
+    const itemId = String(req.params.itemId || '').trim();
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, name, operation, price, stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'gas item not found' });
+        }
+
+        const updates = [];
+        const values = [itemId];
+        ['name', 'operation'].forEach((field) => {
+            if (req.body[field] !== undefined) {
+                values.push(String(req.body[field] || '').trim());
+                updates.push(`${field} = $${values.length}`);
+            }
+        });
+        if (req.body.imageUrl !== undefined || req.body.image_url !== undefined) {
+            values.push(String(req.body.imageUrl || req.body.image_url || '').trim() || null);
+            updates.push(`image_url = $${values.length}`);
+        }
+        if (req.body.price !== undefined) {
+            values.push(Number(req.body.price));
+            updates.push(`price = $${values.length}`);
+        }
+        if (req.body.active !== undefined) {
+            values.push(Boolean(req.body.active));
+            updates.push(`active = $${values.length}`);
+        }
+
+        if (updates.length === 0) {
+            await client.query('ROLLBACK');
+            return res.json(mapGasItem(before.rows[0]));
+        }
+
+        const result = await client.query(`
+            UPDATE gas_items
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, name, operation, price, stock, image_url, active
+        `, values);
+        await logAudit(client, req, 'UPDATE', 'GAS_ITEM', itemId, req.body.reason || 'update gas item', mapGasItem(before.rows[0]), mapGasItem(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapGasItem(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/gas/items/:itemId', requireOwner, async (req, res) => {
+    const itemId = String(req.params.itemId || '').trim();
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, name, operation, price, stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'gas item not found' });
+        }
+
+        const result = await client.query(`
+            UPDATE gas_items
+            SET active = FALSE, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, name, operation, price, stock, image_url, active
+        `, [itemId]);
+        await logAudit(client, req, 'DELETE', 'GAS_ITEM', itemId, req.body.reason || 'deactivate gas item', mapGasItem(before.rows[0]), mapGasItem(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapGasItem(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/gas/items/:itemId/stock', requireOwner, async (req, res) => {
+    const itemId = String(req.params.itemId || '').trim();
+    const delta = Number(req.body.delta);
+    const reason = String(req.body.reason || '').trim();
+
+    if (!itemId || !Number.isFinite(delta) || delta === 0 || !reason) {
+        return res.status(400).json({ error: 'gas item id, non-zero delta, and reason are required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await adjustGasStock(client, req, itemId, Math.floor(delta), reason, 'STOCK_ADJUST', itemId);
+        const result = await client.query(`
+            SELECT id, name, operation, price, stock, image_url, active
+            FROM gas_items
+            WHERE id = $1
+        `, [itemId]);
+        await logAudit(client, req, 'STOCK_ADJUST', 'GAS_ITEM', itemId, reason, null, mapGasItem(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapGasItem(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    } finally {
+        client.release();
     }
 });
 
@@ -931,8 +3255,10 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
     const address = String(req.body.address || '').trim();
     const driver = String(req.body.driver || '').trim() || 'ยังไม่ระบุ';
     const deliveryFee = Math.max(0, Number(req.body.deliveryFee || 0));
-    const paid = req.body.paid !== false;
-    const requestedReturnedTankQuantity = Math.max(0, Math.floor(Number(req.body.emptyTankReturnQuantity || 0)));
+    const paid = req.user.role === OWNER_ROLE ? req.body.paid !== false : false;
+    const requestedReturnedTankQuantity = req.user.role === OWNER_ROLE
+        ? Math.max(0, Math.floor(Number(req.body.emptyTankReturnQuantity || 0)))
+        : 0;
 
     if (orderItems.length === 0) {
         return res.status(400).json({ error: "gas items are required" });
@@ -945,7 +3271,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const session = await ensureAppSession(req.params.sessionId, client);
+        const session = await ensureOpenAppSession(req.params.sessionId, client);
         const createdAt = new Date();
         const jobId = createSaleId('GAS', createdAt);
         const normalizedItems = [];
@@ -976,7 +3302,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
                 return res.status(409).json({ error: "Gas stock is not enough", item });
             }
 
-            await client.query('UPDATE gas_items SET stock = stock - $1, updated_at = NOW() WHERE id = $2', [quantity, gasItemId]);
+            await adjustGasStock(client, req, gasItemId, -quantity, `Gas job ${jobId}`, 'GAS_JOB', jobId);
             normalizedItems.push({
                 id: item.id,
                 name: item.name,
@@ -1044,10 +3370,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
             const pendingQuantity = item.quantity - returnedForItem;
 
             if (returnedForItem > 0) {
-                await client.query('UPDATE gas_items SET stock = stock + $1, updated_at = NOW() WHERE id = $2', [
-                    returnedForItem,
-                    item.id,
-                ]);
+                await adjustGasStock(client, req, item.id, returnedForItem, `Gas tank returned on ${jobId}`, 'GAS_JOB', jobId);
             }
 
             if (pendingQuantity > 0) {
@@ -1116,7 +3439,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
     }
 });
 
-app.patch('/api/app-sessions/:sessionId/gas/jobs/:jobId', async (req, res) => {
+app.patch('/api/app-sessions/:sessionId/gas/jobs/:jobId', requireOwner, async (req, res) => {
     const rawStatus = String(req.body.status || '').trim().toUpperCase();
     const status = rawStatus === 'DONE' || rawStatus === 'COMPLETED'
         ? 'เสร็จแล้ว'
@@ -1164,7 +3487,7 @@ app.patch('/api/app-sessions/:sessionId/gas/jobs/:jobId', async (req, res) => {
     }
 });
 
-app.patch('/api/app-sessions/:sessionId/gas/returns/:returnId', async (req, res) => {
+app.patch('/api/app-sessions/:sessionId/gas/returns/:returnId', requireOwner, async (req, res) => {
     const requestedQuantity = Math.floor(Number(req.body.quantity || 0));
 
     const client = await pool.connect();
@@ -1197,22 +3520,30 @@ app.patch('/api/app-sessions/:sessionId/gas/returns/:returnId', async (req, res)
         if (returnedQuantity >= currentQuantity) {
             await client.query(`
                 UPDATE gas_returns
-                SET status = 'RETURNED', returned_at = NOW()
+                SET status = 'RETURNED',
+                    returned_at = NOW(),
+                    returned_quantity = returned_quantity + $3
                 WHERE id = $1 AND session_id = $2
-            `, [req.params.returnId, session.session_id]);
+            `, [req.params.returnId, session.session_id, returnedQuantity]);
         } else {
             await client.query(`
                 UPDATE gas_returns
-                SET quantity = quantity - $1
+                SET quantity = quantity - $1,
+                    returned_quantity = returned_quantity + $1
                 WHERE id = $2 AND session_id = $3
             `, [returnedQuantity, req.params.returnId, session.session_id]);
         }
 
         if (returnItem.gas_item_id) {
-            await client.query('UPDATE gas_items SET stock = stock + $1, updated_at = NOW() WHERE id = $2', [
-                returnedQuantity,
+            await adjustGasStock(
+                client,
+                req,
                 returnItem.gas_item_id,
-            ]);
+                returnedQuantity,
+                `Gas tank returned ${req.params.returnId}`,
+                'GAS_JOB',
+                returnItem.job_id || req.params.returnId,
+            );
         }
 
         if (returnItem.job_id) {
@@ -1260,6 +3591,613 @@ app.patch('/api/app-sessions/:sessionId/gas/returns/:returnId', async (req, res)
     }
 });
 
+app.post('/api/app-sessions/:sessionId/gas/jobs/:jobId/cancel', requireOwner, async (req, res) => {
+    const reason = String(req.body.reason || '').trim();
+    if (!reason) {
+        return res.status(400).json({ error: 'cancel reason is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureAppSession(req.params.sessionId, client);
+        const before = await client.query(`
+            SELECT *
+            FROM gas_jobs
+            WHERE id = $1 AND session_id = $2
+            FOR UPDATE
+        `, [req.params.jobId, session.session_id]);
+        const job = before.rows[0];
+        if (!job) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'gas job not found' });
+        }
+        if (job.status === 'CANCELLED') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'gas job already cancelled' });
+        }
+
+        await reverseInventoryMovements(client, req, 'GAS_JOB', req.params.jobId, reason);
+        const result = await client.query(`
+            UPDATE gas_jobs
+            SET status = 'CANCELLED',
+                cancel_reason = $1,
+                cancelled_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $2 AND session_id = $3
+            RETURNING *
+        `, [reason, req.params.jobId, session.session_id]);
+        await client.query(`
+            UPDATE gas_returns
+            SET status = 'CANCELLED', cancelled_at = NOW()
+            WHERE job_id = $1 AND session_id = $2 AND status = 'PENDING'
+        `, [req.params.jobId, session.session_id]);
+        await client.query(`
+            UPDATE sales_records
+            SET status = 'CANCELLED',
+                cancel_reason = $1,
+                cancelled_at = NOW(),
+                cancelled_by = $2,
+                updated_at = NOW()
+            WHERE id = $3 AND session_id = $4
+        `, [reason, req.user.id, req.params.jobId, session.session_id]);
+        await logAudit(client, req, 'CANCEL', 'GAS_JOB', req.params.jobId, reason, job, result.rows[0]);
+        await client.query('COMMIT');
+        res.json(await getGasState(session.session_id));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/lottery/tickets', async (req, res) => {
+    try {
+        const includeInactive = req.user?.role === OWNER_ROLE && String(req.query.includeInactive || '') === 'true';
+        const result = await pool.query(`
+            SELECT id, number, series, price, remaining, active
+            FROM lottery_tickets
+            WHERE ($1::boolean = TRUE OR active = TRUE)
+            ORDER BY number ASC
+        `, [includeInactive]);
+        res.json(result.rows.map(mapLotteryTicket));
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+app.post('/api/lottery/tickets', requireOwner, async (req, res) => {
+    const number = String(req.body.number || '').replace(/\D/g, '').slice(0, 6);
+    const series = String(req.body.series || 'Manual').trim() || 'Manual';
+    const quantity = Math.floor(Number(req.body.quantity ?? req.body.remaining ?? 0));
+    const price = Number(req.body.price);
+    const reason = String(req.body.reason || 'manual lottery stock').trim();
+
+    if (!/^\d{6}$/.test(number) || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0) {
+        return res.status(400).json({ error: 'number, quantity, and price are required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const ticketResult = await client.query(`
+            INSERT INTO lottery_tickets (number, series, price, remaining, active)
+            VALUES ($1, $2, $3, 0, TRUE)
+            ON CONFLICT (number)
+            DO UPDATE SET series = EXCLUDED.series, price = EXCLUDED.price, active = TRUE, updated_at = NOW()
+            RETURNING id, number, series, price, remaining, active
+        `, [number, series, price]);
+        await adjustLotteryStock(client, req, ticketResult.rows[0].id, quantity, reason, 'LOTTERY_STOCK', ticketResult.rows[0].id);
+        const result = await client.query('SELECT id, number, series, price, remaining, active FROM lottery_tickets WHERE id = $1', [ticketResult.rows[0].id]);
+        await logAudit(client, req, 'UPSERT', 'LOTTERY_TICKET', ticketResult.rows[0].id, reason, null, mapLotteryTicket(result.rows[0]));
+        await client.query('COMMIT');
+        res.status(201).json(mapLotteryTicket(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/lottery/tickets/:ticketId', requireOwner, async (req, res) => {
+    const ticketId = Number(req.params.ticketId);
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, number, series, price, remaining, active FROM lottery_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'lottery ticket not found' });
+        }
+
+        const updates = [];
+        const values = [ticketId];
+        if (req.body.number !== undefined) {
+            values.push(String(req.body.number || '').replace(/\D/g, '').slice(0, 6));
+            updates.push(`number = $${values.length}`);
+        }
+        if (req.body.series !== undefined) {
+            values.push(String(req.body.series || 'Manual').trim() || 'Manual');
+            updates.push(`series = $${values.length}`);
+        }
+        if (req.body.price !== undefined) {
+            values.push(Number(req.body.price));
+            updates.push(`price = $${values.length}`);
+        }
+        if (req.body.active !== undefined) {
+            values.push(Boolean(req.body.active));
+            updates.push(`active = $${values.length}`);
+        }
+        if (Number.isFinite(Number(req.body.delta)) && Number(req.body.delta) !== 0) {
+            await adjustLotteryStock(
+                client,
+                req,
+                ticketId,
+                Math.floor(Number(req.body.delta)),
+                String(req.body.reason || 'lottery stock adjustment'),
+                'LOTTERY_STOCK_ADJUST',
+                ticketId,
+            );
+        }
+
+        if (updates.length > 0) {
+            await client.query(`
+                UPDATE lottery_tickets
+                SET ${updates.join(', ')}, updated_at = NOW()
+                WHERE id = $1
+            `, values);
+        }
+
+        const result = await client.query('SELECT id, number, series, price, remaining, active FROM lottery_tickets WHERE id = $1', [ticketId]);
+        await logAudit(client, req, 'UPDATE', 'LOTTERY_TICKET', ticketId, req.body.reason || 'update lottery ticket', mapLotteryTicket(before.rows[0]), mapLotteryTicket(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapLotteryTicket(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'lottery number already exists' });
+        }
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/lottery/tickets/:ticketId', requireOwner, async (req, res) => {
+    const ticketId = Number(req.params.ticketId);
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const before = await client.query('SELECT id, number, series, price, remaining, active FROM lottery_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'lottery ticket not found' });
+        }
+
+        const result = await client.query(`
+            UPDATE lottery_tickets
+            SET active = FALSE, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, number, series, price, remaining, active
+        `, [ticketId]);
+        await logAudit(client, req, 'DELETE', 'LOTTERY_TICKET', ticketId, req.body.reason || 'deactivate lottery ticket', mapLotteryTicket(before.rows[0]), mapLotteryTicket(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapLotteryTicket(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/lottery-sessions/:sessionId/cart', async (req, res) => {
+    try {
+        const sessionId = await ensureLotteryCartSession(req.params.sessionId);
+        res.json(await getLotteryCartResponse(sessionId));
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    }
+});
+
+app.post('/api/lottery-sessions/:sessionId/cart/items', async (req, res) => {
+    const number = String(req.body.number || '').replace(/\D/g, '').slice(0, 6);
+    if (!/^\d{6}$/.test(number)) {
+        return res.status(400).json({ error: 'valid lottery number is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureOpenAppSession(req.params.sessionId, client);
+        const sessionId = await ensureLotteryCartSession(session.session_id, client);
+        const ticketResult = await client.query(`
+            SELECT id, number, series, price, remaining
+            FROM lottery_tickets
+            WHERE number = $1 AND active = TRUE
+            FOR UPDATE
+        `, [number]);
+        const ticket = ticketResult.rows[0];
+        if (!ticket) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'lottery ticket not found' });
+        }
+
+        const existingResult = await client.query('SELECT quantity FROM lottery_cart_items WHERE session_id = $1 AND ticket_id = $2', [
+            sessionId,
+            ticket.id,
+        ]);
+        const currentQuantity = Number(existingResult.rows[0]?.quantity || 0);
+        if (currentQuantity >= Number(ticket.remaining || 0)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Lottery stock is not enough', ticket: mapLotteryTicket(ticket) });
+        }
+
+        await client.query(`
+            INSERT INTO lottery_cart_items (session_id, ticket_id, number, series, price, quantity)
+            VALUES ($1, $2, $3, $4, $5, 1)
+            ON CONFLICT (session_id, ticket_id)
+            DO UPDATE SET quantity = lottery_cart_items.quantity + 1, price = EXCLUDED.price, updated_at = NOW()
+        `, [sessionId, ticket.id, ticket.number, ticket.series, ticket.price]);
+        await client.query('UPDATE lottery_cart_sessions SET updated_at = NOW() WHERE session_id = $1', [sessionId]);
+        const response = await getLotteryCartResponse(sessionId, client);
+        await client.query('COMMIT');
+        res.status(201).json(response);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/lottery-sessions/:sessionId/cart/items/:ticketId', async (req, res) => {
+    const ticketId = Number(req.params.ticketId);
+    const quantity = Math.floor(Number(req.body.quantity));
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureOpenAppSession(req.params.sessionId, client);
+        const sessionId = await ensureLotteryCartSession(session.session_id, client);
+        if (!Number.isInteger(ticketId)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'valid ticket id is required' });
+        }
+
+        if (Number.isFinite(quantity) && quantity <= 0) {
+            await client.query('DELETE FROM lottery_cart_items WHERE session_id = $1 AND ticket_id = $2', [sessionId, ticketId]);
+        } else if (Number.isFinite(quantity)) {
+            const ticketResult = await client.query('SELECT remaining FROM lottery_tickets WHERE id = $1', [ticketId]);
+            const remaining = Number(ticketResult.rows[0]?.remaining || 0);
+            if (quantity > remaining) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({ error: 'Lottery stock is not enough', remaining });
+            }
+            await client.query(`
+                UPDATE lottery_cart_items
+                SET quantity = $1, updated_at = NOW()
+                WHERE session_id = $2 AND ticket_id = $3
+            `, [quantity, sessionId, ticketId]);
+        }
+
+        await client.query('UPDATE lottery_cart_sessions SET updated_at = NOW() WHERE session_id = $1', [sessionId]);
+        const response = await getLotteryCartResponse(sessionId, client);
+        await client.query('COMMIT');
+        res.json(response);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/lottery-sessions/:sessionId/cart/items/:ticketId', async (req, res) => {
+    try {
+        const session = await ensureOpenAppSession(req.params.sessionId);
+        const sessionId = await ensureLotteryCartSession(session.session_id);
+        await pool.query('DELETE FROM lottery_cart_items WHERE session_id = $1 AND ticket_id = $2', [sessionId, Number(req.params.ticketId)]);
+        await pool.query('UPDATE lottery_cart_sessions SET updated_at = NOW() WHERE session_id = $1', [sessionId]);
+        res.json(await getLotteryCartResponse(sessionId));
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    }
+});
+
+app.delete('/api/lottery-sessions/:sessionId/cart', async (req, res) => {
+    try {
+        const session = await ensureOpenAppSession(req.params.sessionId);
+        const sessionId = await ensureLotteryCartSession(session.session_id);
+        await pool.query('DELETE FROM lottery_cart_items WHERE session_id = $1', [sessionId]);
+        await pool.query('UPDATE lottery_cart_sessions SET updated_at = NOW() WHERE session_id = $1', [sessionId]);
+        res.json(await getLotteryCartResponse(sessionId));
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    }
+});
+
+app.post('/api/app-sessions/:sessionId/lottery/checkout', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureOpenAppSession(req.params.sessionId, client);
+        const sessionId = await ensureLotteryCartSession(session.session_id, client);
+        const cart = await getLotteryCartItems(sessionId, client);
+        if (cart.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'lottery cart is empty' });
+        }
+
+        const paymentMethod = req.body.paymentMethod || 'cash';
+        const subtotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
+        const cashReceived = paymentMethod === 'PromptPay' ? subtotal : Number(req.body.cashReceived || 0);
+        if (paymentMethod !== 'PromptPay' && cashReceived < subtotal) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'cash received is not enough', shortage: subtotal - cashReceived });
+        }
+
+        const createdAt = new Date();
+        const saleId = createSaleId('LOTTERY', createdAt);
+        for (const item of cart) {
+            const ticketResult = await client.query('SELECT remaining FROM lottery_tickets WHERE id = $1 FOR UPDATE', [Number(item.id)]);
+            const remaining = Number(ticketResult.rows[0]?.remaining || 0);
+            if (remaining < item.quantity) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({ error: 'Lottery stock is not enough', item });
+            }
+            await adjustLotteryStock(client, req, Number(item.id), -item.quantity, `Lottery sale ${saleId}`, 'LOTTERY_SALE', saleId);
+        }
+
+        const sale = {
+            id: saleId,
+            channel: 'LOTTERY',
+            createdAt,
+            customerName: req.body.customerName || 'walk-in',
+            staffName: req.body.cashierName || req.user.displayName || req.user.username,
+            paymentMethod,
+            status: 'completed',
+            items: cart.map((item) => ({
+                id: item.id,
+                ticketId: item.id,
+                number: item.number,
+                name: item.name,
+                barcode: item.number,
+                quantity: item.quantity,
+                price: item.price,
+                discount: 0,
+            })),
+            subtotal,
+            discount: 0,
+            total: subtotal,
+            cashReceived,
+            change: Math.max(0, cashReceived - subtotal),
+            note: req.body.note || 'lottery sale',
+        };
+
+        await insertSaleRecord(client, sessionId, sale);
+        await client.query('DELETE FROM lottery_cart_items WHERE session_id = $1', [sessionId]);
+        await client.query('UPDATE lottery_cart_sessions SET updated_at = NOW() WHERE session_id = $1', [sessionId]);
+        await logAudit(client, req, 'CHECKOUT', 'LOTTERY_SALE', saleId, 'lottery checkout', null, sale);
+        await client.query('COMMIT');
+        res.status(201).json({
+            sale: mapSaleRecord({
+                id: sale.id,
+                channel: sale.channel,
+                created_at: sale.createdAt,
+                customer_name: sale.customerName,
+                staff_name: sale.staffName,
+                payment_method: sale.paymentMethod,
+                status: sale.status,
+                items: sale.items,
+                subtotal: sale.subtotal,
+                discount: sale.discount,
+                total: sale.total,
+                cash_received: sale.cashReceived,
+                change: sale.change,
+                note: sale.note,
+            }),
+            cart: await getLotteryCartResponse(sessionId, client),
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/app-sessions/:sessionId/topups', async (req, res) => {
+    try {
+        const session = await ensureAppSession(req.params.sessionId);
+        const includeCancelled = req.user?.role === OWNER_ROLE && String(req.query.includeCancelled || '') === 'true';
+        const result = await pool.query(`
+            SELECT *
+            FROM mobile_topup_orders
+            WHERE session_id = $1
+              AND ($2::boolean = TRUE OR status <> 'CANCELLED')
+            ORDER BY created_at DESC
+        `, [session.session_id, includeCancelled]);
+        res.json(result.rows.map(mapTopupOrder));
+    } catch (err) {
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    }
+});
+
+app.post('/api/app-sessions/:sessionId/topups', async (req, res) => {
+    const provider = String(req.body.provider || '').trim().toUpperCase();
+    const phone = String(req.body.phone || '').replace(/\D/g, '');
+    const amount = Number(req.body.amount);
+
+    if (!['AIS', 'TRUE', 'DTAC'].includes(provider) || !/^0\d{9}$/.test(phone) || !Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ error: 'provider, phone, and amount are required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureOpenAppSession(req.params.sessionId, client);
+        const createdAt = new Date();
+        const id = createTopupId(createdAt);
+        const result = await client.query(`
+            INSERT INTO mobile_topup_orders (
+                id,
+                session_id,
+                provider,
+                phone,
+                amount,
+                topped_up,
+                paid,
+                status,
+                created_by,
+                created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, FALSE, FALSE, 'ACTIVE', $6, $7)
+            RETURNING *
+        `, [id, session.session_id, provider, phone, amount, req.user.id, createdAt]);
+        await logAudit(client, req, 'CREATE', 'TOPUP', id, 'create topup order', null, mapTopupOrder(result.rows[0]));
+        await client.query('COMMIT');
+        res.status(201).json(mapTopupOrder(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/app-sessions/:sessionId/topups/:orderId', requireOwner, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureAppSession(req.params.sessionId, client);
+        const before = await client.query(`
+            SELECT *
+            FROM mobile_topup_orders
+            WHERE id = $1 AND session_id = $2
+            FOR UPDATE
+        `, [req.params.orderId, session.session_id]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'topup order not found' });
+        }
+        if (before.rows[0].status === 'CANCELLED') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'topup order is cancelled' });
+        }
+
+        const updates = [];
+        const values = [req.params.orderId, session.session_id];
+        if (req.body.provider !== undefined) {
+            const provider = String(req.body.provider || '').trim().toUpperCase();
+            if (!['AIS', 'TRUE', 'DTAC'].includes(provider)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'valid provider is required' });
+            }
+            values.push(provider);
+            updates.push(`provider = $${values.length}`);
+        }
+        if (req.body.phone !== undefined) {
+            values.push(String(req.body.phone || '').replace(/\D/g, ''));
+            updates.push(`phone = $${values.length}`);
+        }
+        if (req.body.amount !== undefined) {
+            values.push(Number(req.body.amount));
+            updates.push(`amount = $${values.length}`);
+        }
+        if (req.body.toppedUp !== undefined || req.body.topped_up !== undefined) {
+            values.push(Boolean(req.body.toppedUp ?? req.body.topped_up));
+            updates.push(`topped_up = $${values.length}`);
+        }
+        if (req.body.paid !== undefined) {
+            values.push(Boolean(req.body.paid));
+            updates.push(`paid = $${values.length}`);
+        }
+
+        if (updates.length === 0) {
+            await client.query('ROLLBACK');
+            return res.json(mapTopupOrder(before.rows[0]));
+        }
+
+        const result = await client.query(`
+            UPDATE mobile_topup_orders
+            SET ${updates.join(', ')}, updated_at = NOW()
+            WHERE id = $1 AND session_id = $2
+            RETURNING *
+        `, values);
+        await logAudit(client, req, 'UPDATE', 'TOPUP', req.params.orderId, req.body.reason || 'update topup order', mapTopupOrder(before.rows[0]), mapTopupOrder(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapTopupOrder(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/app-sessions/:sessionId/topups/:orderId', requireOwner, async (req, res) => {
+    const reason = String(req.body.reason || req.query.reason || '').trim();
+    if (!reason) {
+        return res.status(400).json({ error: 'cancel reason is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureAppSession(req.params.sessionId, client);
+        const before = await client.query(`
+            SELECT *
+            FROM mobile_topup_orders
+            WHERE id = $1 AND session_id = $2
+            FOR UPDATE
+        `, [req.params.orderId, session.session_id]);
+        if (!before.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'topup order not found' });
+        }
+        if (before.rows[0].status === 'CANCELLED') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'topup order already cancelled' });
+        }
+
+        const result = await client.query(`
+            UPDATE mobile_topup_orders
+            SET status = 'CANCELLED',
+                cancel_reason = $1,
+                cancelled_by = $2,
+                cancelled_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $3 AND session_id = $4
+            RETURNING *
+        `, [reason, req.user.id, req.params.orderId, session.session_id]);
+        await logAudit(client, req, 'CANCEL', 'TOPUP', req.params.orderId, reason, mapTopupOrder(before.rows[0]), mapTopupOrder(result.rows[0]));
+        await client.query('COMMIT');
+        res.json(mapTopupOrder(result.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err.message);
+        res.status(err.statusCode || 500).json({ error: err.message || 'Database error' });
+    } finally {
+        client.release();
+    }
+});
+
 app.get('/api/pos-sessions/:sessionId/cart', async (req, res) => {
     try {
         const sessionId = await ensureCartSession(req.params.sessionId);
@@ -1288,7 +4226,8 @@ app.post('/api/pos-sessions/:sessionId/cart/scan', async (req, res) => {
                 p.price,
                 p.stock
             FROM products p
-            WHERE LOWER(p.barcode) = $1 OR LOWER(p.name) LIKE $2
+            WHERE p.active = TRUE
+              AND (LOWER(p.barcode) = $1 OR LOWER(p.name) LIKE $2)
             ORDER BY CASE WHEN LOWER(p.barcode) = $1 THEN 0 ELSE 1 END, p.id ASC
             LIMIT 1
         `, [query, `%${query}%`]);
