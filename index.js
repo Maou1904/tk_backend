@@ -239,6 +239,39 @@ async function initializeCartTables() {
     `);
 
     await pool.query(`
+        CREATE TABLE IF NOT EXISTS product_registration_requests (
+            id SERIAL PRIMARY KEY,
+            barcode TEXT NOT NULL,
+            name TEXT NOT NULL,
+            price NUMERIC(12, 2) NOT NULL DEFAULT 0,
+            cost NUMERIC(12, 2) NOT NULL DEFAULT 0,
+            stock INTEGER NOT NULL DEFAULT 0,
+            category TEXT NOT NULL DEFAULT '',
+            min_stock INTEGER NOT NULL DEFAULT 5,
+            unit TEXT NOT NULL DEFAULT 'piece',
+            status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+            requested_by INTEGER REFERENCES app_users(id),
+            reviewed_by INTEGER REFERENCES app_users(id),
+            accepted_product_id INTEGER REFERENCES products(id),
+            review_reason TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reviewed_at TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_product_registration_requests_pending_barcode
+        ON product_registration_requests (barcode)
+        WHERE status = 'PENDING'
+    `);
+
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_product_registration_requests_status_created
+        ON product_registration_requests (status, created_at DESC)
+    `);
+
+    await pool.query(`
         CREATE TABLE IF NOT EXISTS staff_members (
             id VARCHAR(40) PRIMARY KEY,
             name TEXT NOT NULL,
@@ -696,6 +729,51 @@ function mapProduct(row) {
     };
 }
 
+function productDraftFromBody(body) {
+    const price = Number(body.price);
+    const cost = Number(body.cost || body.price || 0);
+    const stock = Math.max(0, Math.floor(Number(body.stock || 0)));
+    const minStock = Math.max(0, Math.floor(Number(body.minStock || body.min_stock || 5)));
+
+    return {
+        barcode: String(body.barcode || '').trim(),
+        name: String(body.name || '').trim(),
+        price,
+        cost,
+        stock,
+        category: String(body.category || '').trim(),
+        minStock,
+        unit: String(body.unit || 'piece').trim() || 'piece',
+    };
+}
+
+function validateProductDraft(draft) {
+    return Boolean(draft.barcode && draft.name && Number.isFinite(draft.price) && draft.price > 0);
+}
+
+function mapProductRegistrationRequest(row) {
+    return {
+        id: Number(row.id),
+        barcode: row.barcode,
+        name: row.name,
+        price: Number(row.price),
+        cost: Number(row.cost),
+        stock: Number(row.stock),
+        category: row.category || '',
+        minStock: Number(row.min_stock ?? 5),
+        unit: row.unit || 'piece',
+        status: row.status,
+        requestedBy: row.requested_by === undefined || row.requested_by === null ? null : Number(row.requested_by),
+        requestedByName: row.requested_by_name || 'system',
+        reviewedBy: row.reviewed_by === undefined || row.reviewed_by === null ? null : Number(row.reviewed_by),
+        reviewedByName: row.reviewed_by_name || '',
+        acceptedProductId: row.accepted_product_id === undefined || row.accepted_product_id === null ? null : Number(row.accepted_product_id),
+        reviewReason: row.review_reason || '',
+        createdAt: row.created_at,
+        reviewedAt: row.reviewed_at || null,
+    };
+}
+
 function mapLotteryTicket(row) {
     return {
         id: Number(row.id),
@@ -1004,6 +1082,62 @@ async function ensureCategory(name, client = pool) {
 
     const categoryResult = await client.query('INSERT INTO categories (name) VALUES ($1) RETURNING id', [name]);
     return categoryResult.rows[0].id;
+}
+
+async function createProductFromDraft(client, req, draft, reason) {
+    const existingProduct = await client.query('SELECT id, active FROM products WHERE barcode = $1 LIMIT 1', [draft.barcode]);
+    if (existingProduct.rows[0]?.active) {
+        const error = new Error('Barcode already exists');
+        error.statusCode = 409;
+        throw error;
+    }
+
+    let categoryId = null;
+    if (draft.category) {
+        categoryId = await ensureCategory(draft.category, client);
+    }
+
+    const productResult = await client.query(`
+        INSERT INTO products (barcode, name, price, cost, stock, category_id, min_stock, unit, active)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
+        ON CONFLICT (barcode)
+        DO UPDATE SET
+            name = EXCLUDED.name,
+            price = EXCLUDED.price,
+            cost = EXCLUDED.cost,
+            stock = EXCLUDED.stock,
+            category_id = EXCLUDED.category_id,
+            min_stock = EXCLUDED.min_stock,
+            unit = EXCLUDED.unit,
+            active = TRUE,
+            updated_at = NOW()
+        RETURNING id, barcode, name, price, cost, stock, category_id, min_stock, unit, active
+    `, [
+        draft.barcode,
+        draft.name,
+        draft.price,
+        draft.cost,
+        draft.stock,
+        categoryId,
+        draft.minStock,
+        draft.unit,
+    ]);
+    const product = { ...productResult.rows[0], category: draft.category || null };
+
+    if (draft.stock > 0) {
+        await recordInventoryMovement(client, req, {
+            itemType: 'PRODUCT',
+            itemId: product.id,
+            itemName: product.name,
+            delta: draft.stock,
+            reason: reason || 'initial product stock',
+            sourceType: 'PRODUCT_CREATE',
+            sourceId: product.id,
+        });
+    }
+
+    await logAudit(client, req, 'UPSERT', 'PRODUCT', product.id, reason || 'upsert product', null, mapProduct(product));
+    return product;
 }
 
 function normalizeSessionId(sessionId) {
@@ -2949,6 +3083,201 @@ app.post('/api/app-sessions/:sessionId/pos/checkout', async (req, res) => {
     }
 });
 
+app.get('/api/product-registration-requests', requireOwner, async (req, res) => {
+    try {
+        const status = String(req.query.status || 'PENDING').trim().toUpperCase();
+        const normalizedStatus = ['PENDING', 'ACCEPTED', 'REJECTED', 'ALL'].includes(status) ? status : 'PENDING';
+        const result = await pool.query(`
+            SELECT
+                r.*,
+                COALESCE(requester.display_name, requester.username, 'system') AS requested_by_name,
+                COALESCE(reviewer.display_name, reviewer.username, '') AS reviewed_by_name
+            FROM product_registration_requests r
+            LEFT JOIN app_users requester ON requester.id = r.requested_by
+            LEFT JOIN app_users reviewer ON reviewer.id = r.reviewed_by
+            WHERE ($1 = 'ALL' OR r.status = $1)
+            ORDER BY
+                CASE WHEN r.status = 'PENDING' THEN 0 ELSE 1 END,
+                r.created_at ASC
+            LIMIT 80
+        `, [normalizedStatus]);
+        res.json(result.rows.map(mapProductRegistrationRequest));
+    } catch (err) {
+        console.error(err.message);
+        res.status(500).json({ error: "Database error" });
+    }
+});
+
+app.post('/api/product-registration-requests', async (req, res) => {
+    const draft = productDraftFromBody(req.body);
+
+    if (!validateProductDraft(draft)) {
+        return res.status(400).json({ error: "barcode, name, and price are required" });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const existingProduct = await client.query('SELECT id FROM products WHERE barcode = $1 AND active = TRUE LIMIT 1', [draft.barcode]);
+        if (existingProduct.rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: "Barcode already exists" });
+        }
+
+        const existingPending = await client.query(`
+            SELECT
+                r.*,
+                COALESCE(requester.display_name, requester.username, 'system') AS requested_by_name,
+                COALESCE(reviewer.display_name, reviewer.username, '') AS reviewed_by_name
+            FROM product_registration_requests r
+            LEFT JOIN app_users requester ON requester.id = r.requested_by
+            LEFT JOIN app_users reviewer ON reviewer.id = r.reviewed_by
+            WHERE r.barcode = $1 AND r.status = 'PENDING'
+            LIMIT 1
+        `, [draft.barcode]);
+        if (existingPending.rows[0]) {
+            await client.query('COMMIT');
+            return res.status(202).json(mapProductRegistrationRequest(existingPending.rows[0]));
+        }
+
+        const insertResult = await client.query(`
+            INSERT INTO product_registration_requests (
+                barcode,
+                name,
+                price,
+                cost,
+                stock,
+                category,
+                min_stock,
+                unit,
+                requested_by
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id
+        `, [
+            draft.barcode,
+            draft.name,
+            draft.price,
+            draft.cost,
+            draft.stock,
+            draft.category,
+            draft.minStock,
+            draft.unit,
+            req.user.id,
+        ]);
+
+        await logAudit(client, req, 'REQUEST_CREATE', 'PRODUCT_REGISTRATION_REQUEST', insertResult.rows[0].id, req.body.reason || 'request product registration', null, draft);
+
+        const requestResult = await client.query(`
+            SELECT
+                r.*,
+                COALESCE(requester.display_name, requester.username, 'system') AS requested_by_name,
+                COALESCE(reviewer.display_name, reviewer.username, '') AS reviewed_by_name
+            FROM product_registration_requests r
+            LEFT JOIN app_users requester ON requester.id = r.requested_by
+            LEFT JOIN app_users reviewer ON reviewer.id = r.reviewed_by
+            WHERE r.id = $1
+        `, [insertResult.rows[0].id]);
+        await client.query('COMMIT');
+        res.status(202).json(mapProductRegistrationRequest(requestResult.rows[0]));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(409).json({ error: "Product registration request already exists" });
+        }
+        console.error(err.message);
+        res.status(500).json({ error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/product-registration-requests/:requestId', requireOwner, async (req, res) => {
+    const requestId = Number(req.params.requestId);
+    const action = String(req.body.action || '').trim().toUpperCase();
+    const reviewReason = String(req.body.reason || '').trim();
+
+    if (!Number.isInteger(requestId) || requestId <= 0) {
+        return res.status(400).json({ error: "valid request id is required" });
+    }
+    if (!['ACCEPT', 'REJECT'].includes(action)) {
+        return res.status(400).json({ error: "action must be ACCEPT or REJECT" });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const beforeResult = await client.query(`
+            SELECT *
+            FROM product_registration_requests
+            WHERE id = $1
+            FOR UPDATE
+        `, [requestId]);
+        const request = beforeResult.rows[0];
+        if (!request) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "product registration request not found" });
+        }
+        if (request.status !== 'PENDING') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: "product registration request is already reviewed" });
+        }
+
+        let product = null;
+        if (action === 'ACCEPT') {
+            product = await createProductFromDraft(
+                client,
+                req,
+                productDraftFromBody(request),
+                reviewReason || `accept product request ${requestId}`,
+            );
+        }
+
+        await client.query(`
+            UPDATE product_registration_requests
+            SET status = $1,
+                reviewed_by = $2,
+                accepted_product_id = $3,
+                review_reason = $4,
+                reviewed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $5
+        `, [
+            action === 'ACCEPT' ? 'ACCEPTED' : 'REJECTED',
+            req.user.id,
+            product?.id || null,
+            reviewReason,
+            requestId,
+        ]);
+
+        const requestResult = await client.query(`
+            SELECT
+                r.*,
+                COALESCE(requester.display_name, requester.username, 'system') AS requested_by_name,
+                COALESCE(reviewer.display_name, reviewer.username, '') AS reviewed_by_name
+            FROM product_registration_requests r
+            LEFT JOIN app_users requester ON requester.id = r.requested_by
+            LEFT JOIN app_users reviewer ON reviewer.id = r.reviewed_by
+            WHERE r.id = $1
+        `, [requestId]);
+        await logAudit(client, req, action === 'ACCEPT' ? 'ACCEPT' : 'REJECT', 'PRODUCT_REGISTRATION_REQUEST', requestId, reviewReason || action.toLowerCase(), mapProductRegistrationRequest(request), mapProductRegistrationRequest(requestResult.rows[0]));
+        await client.query('COMMIT');
+        res.json({
+            request: mapProductRegistrationRequest(requestResult.rows[0]),
+            product: product ? mapProduct(product) : null,
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.statusCode === 409 || err.code === '23505') {
+            return res.status(409).json({ error: err.message || "Barcode already exists" });
+        }
+        console.error(err.message);
+        res.status(500).json({ error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
 app.get('/api/products', async (req, res) => {
     try {
         const includeInactive = req.user?.role === OWNER_ROLE && String(req.query.includeInactive || '') === 'true';
@@ -2978,68 +3307,21 @@ app.get('/api/products', async (req, res) => {
 });
 
 app.post('/api/products', requireOwner, async (req, res) => {
-    const barcode = String(req.body.barcode || '').trim();
-    const name = String(req.body.name || '').trim();
-    const price = Number(req.body.price);
-    const cost = Number(req.body.cost || req.body.price || 0);
-    const stock = Math.max(0, Math.floor(Number(req.body.stock || 0)));
-    const category = String(req.body.category || '').trim();
-    const minStock = Math.max(0, Math.floor(Number(req.body.minStock || req.body.min_stock || 5)));
-    const unit = String(req.body.unit || 'piece').trim() || 'piece';
+    const draft = productDraftFromBody(req.body);
 
-    if (!barcode || !name || !Number.isFinite(price) || price <= 0) {
+    if (!validateProductDraft(draft)) {
         return res.status(400).json({ error: "barcode, name, and price are required" });
     }
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const existingProduct = await client.query('SELECT id, active FROM products WHERE barcode = $1 LIMIT 1', [barcode]);
-        if (existingProduct.rows[0]?.active) {
-            await client.query('ROLLBACK');
-            return res.status(409).json({ error: "Barcode already exists" });
-        }
-
-        let categoryId = null;
-        if (category) {
-            categoryId = await ensureCategory(category, client);
-        }
-
-        const productResult = await client.query(`
-            INSERT INTO products (barcode, name, price, cost, stock, category_id, min_stock, unit, active)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
-            ON CONFLICT (barcode)
-            DO UPDATE SET
-                name = EXCLUDED.name,
-                price = EXCLUDED.price,
-                cost = EXCLUDED.cost,
-                stock = EXCLUDED.stock,
-                category_id = EXCLUDED.category_id,
-                min_stock = EXCLUDED.min_stock,
-                unit = EXCLUDED.unit,
-                active = TRUE,
-                updated_at = NOW()
-            RETURNING id, barcode, name, price, cost, stock, category_id, min_stock, unit, active
-        `, [barcode, name, price, cost, stock, categoryId, minStock, unit]);
-        const product = { ...productResult.rows[0], category: category || null };
-
-        if (stock > 0) {
-            await recordInventoryMovement(client, req, {
-                itemType: 'PRODUCT',
-                itemId: product.id,
-                itemName: product.name,
-                delta: stock,
-                reason: req.body.reason || 'initial product stock',
-                sourceType: 'PRODUCT_CREATE',
-                sourceId: product.id,
-            });
-        }
-        await logAudit(client, req, 'UPSERT', 'PRODUCT', product.id, req.body.reason || 'upsert product', null, mapProduct(product));
+        const product = await createProductFromDraft(client, req, draft, req.body.reason || 'upsert product');
         await client.query('COMMIT');
         res.status(201).json(mapProduct(product));
     } catch (err) {
         await client.query('ROLLBACK');
-        if (err.code === '23505') {
+        if (err.code === '23505' || err.statusCode === 409) {
             return res.status(409).json({ error: "Barcode already exists" });
         }
         console.error(err.message);
