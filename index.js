@@ -384,6 +384,22 @@ async function initializeCartTables() {
         )
     `);
 
+    await pool.query(`ALTER TABLE gas_items ADD COLUMN IF NOT EXISTS full_stock INTEGER NOT NULL DEFAULT 0`);
+    await pool.query(`ALTER TABLE gas_items ADD COLUMN IF NOT EXISTS empty_stock INTEGER NOT NULL DEFAULT 0`);
+    await pool.query(`
+        UPDATE gas_items
+        SET full_stock = CASE
+                WHEN COALESCE(full_stock, 0) = 0 AND COALESCE(stock, 0) > 0 THEN COALESCE(stock, 0)
+                ELSE COALESCE(full_stock, 0)
+            END,
+            stock = CASE
+                WHEN COALESCE(full_stock, 0) = 0 AND COALESCE(stock, 0) > 0 THEN COALESCE(stock, 0)
+                ELSE COALESCE(full_stock, 0)
+            END
+        WHERE COALESCE(full_stock, 0) <> COALESCE(stock, 0)
+           OR (COALESCE(full_stock, 0) = 0 AND COALESCE(stock, 0) > 0)
+    `);
+
     await pool.query(`
         CREATE TABLE IF NOT EXISTS gas_jobs (
             id VARCHAR(80) PRIMARY KEY,
@@ -560,6 +576,8 @@ async function initializeCartTables() {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
+
+    await pool.query(`ALTER TABLE inventory_movements ADD COLUMN IF NOT EXISTS stock_kind VARCHAR(20) NOT NULL DEFAULT 'GENERAL'`);
 
     await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_inventory_movements_source
@@ -757,6 +775,7 @@ function mapInventoryMovement(row) {
         productName: row.item_name,
         itemType: row.item_type,
         itemId: row.item_id,
+        stockKind: row.stock_kind || 'GENERAL',
         delta: Number(row.delta),
         reason: row.reason || '',
         staffName: row.actor_name || 'system',
@@ -765,6 +784,14 @@ function mapInventoryMovement(row) {
         sourceType: row.source_type,
         sourceId: row.source_id,
     };
+}
+
+function normalizeGasStockKind(value) {
+    return String(value || 'FULL').trim().toUpperCase() === 'EMPTY' ? 'EMPTY' : 'FULL';
+}
+
+function gasStockKindText(stockKind) {
+    return normalizeGasStockKind(stockKind) === 'EMPTY' ? 'empty tank' : 'full tank';
 }
 
 async function logAudit(client, req, action, entityType, entityId, reason, beforeData, afterData) {
@@ -805,9 +832,10 @@ async function recordInventoryMovement(client, req, movement) {
             source_type,
             source_id,
             reversed_from,
+            stock_kind,
             created_by
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `, [
         movement.itemType,
         String(movement.itemId),
@@ -817,6 +845,7 @@ async function recordInventoryMovement(client, req, movement) {
         movement.sourceType,
         String(movement.sourceId),
         movement.reversedFrom || null,
+        movement.stockKind || 'GENERAL',
         actor.id,
     ]);
 }
@@ -850,30 +879,61 @@ async function adjustProductStock(client, req, productId, delta, reason, sourceT
     return result.rows[0];
 }
 
-async function adjustGasStock(client, req, gasItemId, delta, reason, sourceType, sourceId, reversedFrom = null) {
-    const result = await client.query(`
-        UPDATE gas_items
-        SET stock = GREATEST(0, COALESCE(stock, 0) + $1),
-            updated_at = NOW()
-        WHERE id = $2
-        RETURNING id, name, operation, stock
-    `, [Math.trunc(Number(delta)), String(gasItemId)]);
+async function adjustGasStock(client, req, gasItemId, delta, reason, sourceType, sourceId, reversedFrom = null, stockKind = 'FULL') {
+    const normalizedDelta = Math.trunc(Number(delta));
+    const normalizedStockKind = normalizeGasStockKind(stockKind);
+    const currentResult = await client.query(`
+        SELECT id, name, operation, stock, full_stock, empty_stock
+        FROM gas_items
+        WHERE id = $1
+        FOR UPDATE
+    `, [String(gasItemId)]);
+    const current = currentResult.rows[0];
 
-    if (!result.rows[0]) {
+    if (!current) {
         const error = new Error('gas item not found');
         error.statusCode = 404;
         throw error;
     }
 
+    const currentStock = normalizedStockKind === 'EMPTY'
+        ? Number(current.empty_stock || 0)
+        : Number(current.full_stock ?? current.stock ?? 0);
+    if (currentStock + normalizedDelta < 0) {
+        const error = new Error(`${gasStockKindText(normalizedStockKind)} stock is not enough`);
+        error.statusCode = 409;
+        throw error;
+    }
+
+    const result = await client.query(`
+        UPDATE gas_items
+        SET full_stock = CASE
+                WHEN $3 = 'EMPTY' THEN COALESCE(full_stock, COALESCE(stock, 0))
+                ELSE COALESCE(full_stock, COALESCE(stock, 0)) + $1
+            END,
+            empty_stock = CASE
+                WHEN $3 = 'EMPTY' THEN COALESCE(empty_stock, 0) + $1
+                ELSE COALESCE(empty_stock, 0)
+            END,
+            stock = CASE
+                WHEN $3 = 'EMPTY' THEN COALESCE(full_stock, COALESCE(stock, 0))
+                ELSE COALESCE(full_stock, COALESCE(stock, 0)) + $1
+            END,
+            updated_at = NOW()
+        WHERE id = $2
+        RETURNING id, name, operation, stock, full_stock, empty_stock
+    `, [normalizedDelta, String(gasItemId), normalizedStockKind]);
+
     await recordInventoryMovement(client, req, {
         itemType: 'GAS',
         itemId: gasItemId,
         itemName: `${result.rows[0].name} ${result.rows[0].operation}`,
-        delta,
+        delta: normalizedDelta,
         reason,
         sourceType,
         sourceId,
         reversedFrom,
+        stockKind: normalizedStockKind,
     });
 
     return result.rows[0];
@@ -927,7 +987,7 @@ async function reverseInventoryMovements(client, req, sourceType, sourceId, reas
         if (movement.item_type === 'PRODUCT') {
             await adjustProductStock(client, req, Number(movement.item_id), reverseDelta, reason, `${sourceType}_REVERSAL`, sourceId, movement.id);
         } else if (movement.item_type === 'GAS') {
-            await adjustGasStock(client, req, movement.item_id, reverseDelta, reason, `${sourceType}_REVERSAL`, sourceId, movement.id);
+            await adjustGasStock(client, req, movement.item_id, reverseDelta, reason, `${sourceType}_REVERSAL`, sourceId, movement.id, normalizeGasStockKind(movement.stock_kind));
         } else if (movement.item_type === 'LOTTERY') {
             await adjustLotteryStock(client, req, Number(movement.item_id), reverseDelta, reason, `${sourceType}_REVERSAL`, sourceId, movement.id);
         }
@@ -1034,12 +1094,20 @@ function mapSaleRecord(row) {
 }
 
 function mapGasItem(row) {
+    const fullStock = Number(row.full_stock ?? row.stock ?? 0);
+    const emptyStock = Number(row.empty_stock ?? 0);
     return {
         id: row.id,
         name: row.name,
         operation: row.operation,
         price: Number(row.price),
-        stock: Number(row.stock),
+        stock: fullStock,
+        fullStock,
+        full_stock: fullStock,
+        emptyStock,
+        empty_stock: emptyStock,
+        totalStock: fullStock + emptyStock,
+        total_stock: fullStock + emptyStock,
         imageUrl: row.image_url || '',
         active: row.active === undefined ? true : Boolean(row.active),
     };
@@ -1308,7 +1376,13 @@ async function getClosingSummary(sessionId, client = pool) {
             COUNT(*)::int AS job_count,
             COALESCE(SUM(total), 0) AS total,
             COALESCE(SUM(delivery_fee), 0) AS delivery_fee_total,
-            COALESCE(SUM(returned_tank_quantity), 0) AS returned_tank_quantity
+            COALESCE(SUM(returned_tank_quantity), 0) AS returned_tank_quantity,
+            COALESCE(SUM(CASE WHEN paid THEN 1 ELSE 0 END), 0)::int AS paid_job_count,
+            COALESCE(SUM(CASE WHEN NOT paid THEN 1 ELSE 0 END), 0)::int AS unpaid_job_count,
+            COALESCE(SUM(CASE WHEN empty_tank_returned THEN 1 ELSE 0 END), 0)::int AS fully_returned_job_count,
+            COALESCE(SUM(CASE WHEN NOT empty_tank_returned THEN 1 ELSE 0 END), 0)::int AS pending_return_job_count,
+            COALESCE(SUM(CASE WHEN completed_at IS NOT NULL THEN 1 ELSE 0 END), 0)::int AS completed_job_count,
+            COALESCE(SUM(CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END), 0)::int AS open_job_count
         FROM gas_jobs
         WHERE session_id = $1
           AND status <> 'CANCELLED'
@@ -1342,7 +1416,9 @@ async function getClosingSummary(sessionId, client = pool) {
 
     const gasBalanceResult = await client.query(`
         WITH day_movements AS (
-            SELECT *
+            SELECT
+                *,
+                CASE WHEN stock_kind = 'EMPTY' THEN 'EMPTY' ELSE 'FULL' END AS gas_stock_kind
             FROM inventory_movements
             WHERE item_type = 'GAS'
               AND created_at >= ($1::date::timestamp AT TIME ZONE 'Asia/Bangkok')
@@ -1355,22 +1431,36 @@ async function getClosingSummary(sessionId, client = pool) {
               AND status = 'PENDING'
               AND gas_item_id IS NOT NULL
             GROUP BY gas_item_id
+        ),
+        sold_items AS (
+            SELECT i.gas_item_id::text AS item_id, COALESCE(SUM(i.quantity), 0) AS sold_quantity
+            FROM gas_jobs j
+            JOIN gas_job_items i ON i.job_id = j.id
+            WHERE j.session_id = $3
+              AND j.status <> 'CANCELLED'
+              AND i.gas_item_id IS NOT NULL
+            GROUP BY i.gas_item_id
         )
         SELECT
             g.id,
             g.name,
             g.operation,
             g.stock,
-            COALESCE(SUM(dm.delta), 0) AS movement_delta,
-            COALESCE(SUM(CASE WHEN dm.source_type = 'GAS_JOB' AND dm.delta < 0 THEN -dm.delta ELSE 0 END), 0) AS sold_quantity,
-            COALESCE(SUM(CASE WHEN dm.source_type = 'GAS_JOB' AND dm.delta > 0 THEN dm.delta ELSE 0 END), 0) AS returned_quantity,
-            COALESCE(SUM(CASE WHEN dm.source_type <> 'GAS_JOB' THEN dm.delta ELSE 0 END), 0) AS adjusted_quantity,
+            g.full_stock,
+            g.empty_stock,
+            COALESCE(SUM(CASE WHEN dm.gas_stock_kind = 'FULL' THEN dm.delta ELSE 0 END), 0) AS full_movement_delta,
+            COALESCE(SUM(CASE WHEN dm.gas_stock_kind = 'EMPTY' THEN dm.delta ELSE 0 END), 0) AS empty_movement_delta,
+            COALESCE(si.sold_quantity, 0) AS sold_quantity,
+            GREATEST(0, COALESCE(SUM(CASE WHEN dm.source_type IN ('GAS_JOB', 'GAS_JOB_REVERSAL') AND dm.gas_stock_kind = 'EMPTY' THEN dm.delta ELSE 0 END), 0)) AS returned_quantity,
+            COALESCE(SUM(CASE WHEN dm.source_type NOT IN ('GAS_JOB', 'GAS_JOB_REVERSAL') AND dm.gas_stock_kind = 'FULL' THEN dm.delta ELSE 0 END), 0) AS full_adjusted_quantity,
+            COALESCE(SUM(CASE WHEN dm.source_type NOT IN ('GAS_JOB', 'GAS_JOB_REVERSAL') AND dm.gas_stock_kind = 'EMPTY' THEN dm.delta ELSE 0 END), 0) AS empty_adjusted_quantity,
             COALESCE(pr.pending_quantity, 0) AS pending_quantity
         FROM gas_items g
         LEFT JOIN day_movements dm ON dm.item_id = g.id
         LEFT JOIN pending_returns pr ON pr.item_id = g.id
+        LEFT JOIN sold_items si ON si.item_id = g.id
         WHERE g.active = TRUE OR dm.id IS NOT NULL OR pr.pending_quantity IS NOT NULL
-        GROUP BY g.id, g.name, g.operation, g.stock, pr.pending_quantity
+        GROUP BY g.id, g.name, g.operation, g.stock, g.full_stock, g.empty_stock, pr.pending_quantity, si.sold_quantity
         ORDER BY g.price DESC, g.id ASC
     `, [businessDate, nextBusinessDate, session.session_id]);
 
@@ -1447,6 +1537,14 @@ async function getClosingSummary(sessionId, client = pool) {
                 pendingReturnQuantity: gasPendingQuantity,
                 total: Number(gasTotalsResult.rows[0].total),
                 deliveryFeeTotal: Number(gasTotalsResult.rows[0].delivery_fee_total),
+                serviceStats: {
+                    paidJobs: Number(gasTotalsResult.rows[0].paid_job_count),
+                    unpaidJobs: Number(gasTotalsResult.rows[0].unpaid_job_count),
+                    fullyReturnedJobs: Number(gasTotalsResult.rows[0].fully_returned_job_count),
+                    pendingReturnJobs: Number(gasTotalsResult.rows[0].pending_return_job_count),
+                    completedJobs: Number(gasTotalsResult.rows[0].completed_job_count),
+                    openJobs: Number(gasTotalsResult.rows[0].open_job_count),
+                },
                 items: gasItemsResult.rows.map((row) => ({
                     id: row.id,
                     name: row.name,
@@ -1460,12 +1558,19 @@ async function getClosingSummary(sessionId, client = pool) {
                     quantity: Number(row.quantity),
                 })),
                 tankBalance: gasBalanceResult.rows.map((row) => {
-                    const stock = Number(row.stock);
-                    const movementDelta = Number(row.movement_delta);
-                    const adjustedQuantity = Number(row.adjusted_quantity);
-                    const openingStock = stock - movementDelta;
+                    const fullStock = Number(row.full_stock ?? row.stock ?? 0);
+                    const emptyStock = Number(row.empty_stock ?? 0);
+                    const fullMovementDelta = Number(row.full_movement_delta);
+                    const emptyMovementDelta = Number(row.empty_movement_delta);
+                    const openingFullStock = fullStock - fullMovementDelta;
+                    const openingEmptyStock = emptyStock - emptyMovementDelta;
+                    const openingStock = openingFullStock + openingEmptyStock;
+                    const currentStock = fullStock + emptyStock;
+                    const adjustedFullQuantity = Number(row.full_adjusted_quantity);
+                    const adjustedEmptyQuantity = Number(row.empty_adjusted_quantity);
+                    const adjustedQuantity = adjustedFullQuantity + adjustedEmptyQuantity;
                     const idealStock = openingStock + adjustedQuantity;
-                    const expectedMissing = idealStock - stock;
+                    const expectedMissing = idealStock - currentStock;
                     const pendingQuantity = Number(row.pending_quantity);
                     const status = expectedMissing <= 0
                         ? 'BALANCED'
@@ -1477,10 +1582,18 @@ async function getClosingSummary(sessionId, client = pool) {
                         name: row.name,
                         operation: row.operation,
                         openingStock,
-                        currentStock: stock,
+                        openingFullStock,
+                        openingEmptyStock,
+                        openingTotalStock: openingStock,
+                        currentStock,
+                        currentFullStock: fullStock,
+                        currentEmptyStock: emptyStock,
+                        currentTotalStock: currentStock,
                         soldQuantity: Number(row.sold_quantity),
                         returnedQuantity: Number(row.returned_quantity),
                         adjustedQuantity,
+                        adjustedFullQuantity,
+                        adjustedEmptyQuantity,
                         pendingQuantity,
                         expectedMissing,
                         status,
@@ -1645,7 +1758,7 @@ async function getLotteryCartResponse(sessionId, client = pool) {
 
 async function getGasState(sessionId, client = pool) {
     const itemsResult = await client.query(`
-        SELECT id, name, operation, price, stock, image_url
+        SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url
         FROM gas_items
         WHERE active = TRUE
         ORDER BY price DESC, id ASC
@@ -3118,7 +3231,7 @@ app.get('/api/gas/items', async (req, res) => {
     try {
         const includeInactive = req.user?.role === OWNER_ROLE && String(req.query.includeInactive || '') === 'true';
         const result = await pool.query(`
-            SELECT id, name, operation, price, stock, image_url, active
+            SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active
             FROM gas_items
             WHERE ($1::boolean = TRUE OR active = TRUE)
             ORDER BY price DESC, id ASC
@@ -3135,42 +3248,68 @@ app.post('/api/gas/items', requireOwner, async (req, res) => {
     const name = String(req.body.name || '').trim();
     const operation = String(req.body.operation || '').trim();
     const price = Number(req.body.price);
-    const stock = Math.max(0, Math.floor(Number(req.body.stock || 0)));
+    const fullStock = Math.max(0, Math.floor(Number(req.body.fullStock ?? req.body.full_stock ?? req.body.stock ?? 0)));
+    const emptyStock = Math.max(0, Math.floor(Number(req.body.emptyStock ?? req.body.empty_stock ?? 0)));
     const imageUrl = String(req.body.imageUrl || req.body.image_url || '').trim();
 
-    if (!id || !name || !operation || !Number.isFinite(price) || price <= 0) {
-        return res.status(400).json({ error: 'id, name, operation, and price are required' });
+    if (!id || !name || !operation || !Number.isFinite(price) || price <= 0 || !Number.isFinite(fullStock) || !Number.isFinite(emptyStock)) {
+        return res.status(400).json({ error: 'id, name, operation, price, full stock, and empty stock are required' });
     }
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        const before = await client.query(`
+            SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active
+            FROM gas_items
+            WHERE id = $1
+            FOR UPDATE
+        `, [id]);
+        const previousFullStock = Number(before.rows[0]?.full_stock ?? before.rows[0]?.stock ?? 0);
+        const previousEmptyStock = Number(before.rows[0]?.empty_stock ?? 0);
+        const fullStockDelta = fullStock - previousFullStock;
+        const emptyStockDelta = emptyStock - previousEmptyStock;
         const result = await client.query(`
-            INSERT INTO gas_items (id, name, operation, price, stock, image_url, active)
-            VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+            INSERT INTO gas_items (id, name, operation, price, stock, full_stock, empty_stock, image_url, active)
+            VALUES ($1, $2, $3, $4, $5, $5, $6, $7, TRUE)
             ON CONFLICT (id)
             DO UPDATE SET
                 name = EXCLUDED.name,
                 operation = EXCLUDED.operation,
                 price = EXCLUDED.price,
                 stock = EXCLUDED.stock,
+                full_stock = EXCLUDED.full_stock,
+                empty_stock = EXCLUDED.empty_stock,
                 image_url = EXCLUDED.image_url,
                 active = TRUE,
                 updated_at = NOW()
-            RETURNING id, name, operation, price, stock, image_url, active
-        `, [id, name, operation, price, stock, imageUrl || null]);
-        if (stock > 0) {
+            RETURNING id, name, operation, price, stock, full_stock, empty_stock, image_url, active
+        `, [id, name, operation, price, fullStock, emptyStock, imageUrl || null]);
+        if (fullStockDelta !== 0) {
             await recordInventoryMovement(client, req, {
                 itemType: 'GAS',
                 itemId: result.rows[0].id,
                 itemName: `${result.rows[0].name} ${result.rows[0].operation}`,
-                delta: stock,
+                delta: fullStockDelta,
                 reason: req.body.reason || 'initial gas stock',
                 sourceType: 'GAS_ITEM_CREATE',
                 sourceId: result.rows[0].id,
+                stockKind: 'FULL',
             });
         }
-        await logAudit(client, req, 'UPSERT', 'GAS_ITEM', id, req.body.reason || 'upsert gas item', null, mapGasItem(result.rows[0]));
+        if (emptyStockDelta !== 0) {
+            await recordInventoryMovement(client, req, {
+                itemType: 'GAS',
+                itemId: result.rows[0].id,
+                itemName: `${result.rows[0].name} ${result.rows[0].operation}`,
+                delta: emptyStockDelta,
+                reason: req.body.reason || 'initial gas empty stock',
+                sourceType: 'GAS_ITEM_CREATE',
+                sourceId: result.rows[0].id,
+                stockKind: 'EMPTY',
+            });
+        }
+        await logAudit(client, req, 'UPSERT', 'GAS_ITEM', id, req.body.reason || 'upsert gas item', before.rows[0] ? mapGasItem(before.rows[0]) : null, mapGasItem(result.rows[0]));
         await client.query('COMMIT');
         res.status(201).json(mapGasItem(result.rows[0]));
     } catch (err) {
@@ -3187,7 +3326,7 @@ app.patch('/api/gas/items/:itemId', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const before = await client.query('SELECT id, name, operation, price, stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
+        const before = await client.query('SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
         if (!before.rows[0]) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'gas item not found' });
@@ -3223,7 +3362,7 @@ app.patch('/api/gas/items/:itemId', requireOwner, async (req, res) => {
             UPDATE gas_items
             SET ${updates.join(', ')}, updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, operation, price, stock, image_url, active
+            RETURNING id, name, operation, price, stock, full_stock, empty_stock, image_url, active
         `, values);
         await logAudit(client, req, 'UPDATE', 'GAS_ITEM', itemId, req.body.reason || 'update gas item', mapGasItem(before.rows[0]), mapGasItem(result.rows[0]));
         await client.query('COMMIT');
@@ -3242,7 +3381,7 @@ app.delete('/api/gas/items/:itemId', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const before = await client.query('SELECT id, name, operation, price, stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
+        const before = await client.query('SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
         if (!before.rows[0]) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'gas item not found' });
@@ -3252,7 +3391,7 @@ app.delete('/api/gas/items/:itemId', requireOwner, async (req, res) => {
             UPDATE gas_items
             SET active = FALSE, updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, operation, price, stock, image_url, active
+            RETURNING id, name, operation, price, stock, full_stock, empty_stock, image_url, active
         `, [itemId]);
         await logAudit(client, req, 'DELETE', 'GAS_ITEM', itemId, req.body.reason || 'deactivate gas item', mapGasItem(before.rows[0]), mapGasItem(result.rows[0]));
         await client.query('COMMIT');
@@ -3270,6 +3409,7 @@ app.patch('/api/gas/items/:itemId/stock', requireOwner, async (req, res) => {
     const itemId = String(req.params.itemId || '').trim();
     const delta = Number(req.body.delta);
     const reason = String(req.body.reason || '').trim();
+    const stockKind = normalizeGasStockKind(req.body.stockKind || req.body.stock_kind || 'FULL');
 
     if (!itemId || !Number.isFinite(delta) || delta === 0 || !reason) {
         return res.status(400).json({ error: 'gas item id, non-zero delta, and reason are required' });
@@ -3278,9 +3418,9 @@ app.patch('/api/gas/items/:itemId/stock', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        await adjustGasStock(client, req, itemId, Math.floor(delta), reason, 'STOCK_ADJUST', itemId);
+        await adjustGasStock(client, req, itemId, Math.floor(delta), reason, 'STOCK_ADJUST', itemId, null, stockKind);
         const result = await client.query(`
-            SELECT id, name, operation, price, stock, image_url, active
+            SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active
             FROM gas_items
             WHERE id = $1
         `, [itemId]);
@@ -3344,7 +3484,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
             }
 
             const itemResult = await client.query(`
-                SELECT id, name, operation, price, stock
+                SELECT id, name, operation, price, stock, full_stock, empty_stock
                 FROM gas_items
                 WHERE id = $1 AND active = TRUE
                 FOR UPDATE
@@ -3355,12 +3495,13 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
                 return res.status(404).json({ error: "gas item not found", gasItemId });
             }
 
-            if (Number(item.stock) < quantity) {
+            const availableFullStock = Number(item.full_stock ?? item.stock ?? 0);
+            if (availableFullStock < quantity) {
                 await client.query('ROLLBACK');
                 return res.status(409).json({ error: "Gas stock is not enough", item });
             }
 
-            await adjustGasStock(client, req, gasItemId, -quantity, `Gas job ${jobId}`, 'GAS_JOB', jobId);
+            await adjustGasStock(client, req, gasItemId, -quantity, `Gas job ${jobId}`, 'GAS_JOB', jobId, null, 'FULL');
             normalizedItems.push({
                 id: item.id,
                 name: item.name,
@@ -3428,7 +3569,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
             const pendingQuantity = item.quantity - returnedForItem;
 
             if (returnedForItem > 0) {
-                await adjustGasStock(client, req, item.id, returnedForItem, `Gas tank returned on ${jobId}`, 'GAS_JOB', jobId);
+                await adjustGasStock(client, req, item.id, returnedForItem, `Gas tank returned on ${jobId}`, 'GAS_JOB', jobId, null, 'EMPTY');
             }
 
             if (pendingQuantity > 0) {
@@ -3601,6 +3742,8 @@ app.patch('/api/app-sessions/:sessionId/gas/returns/:returnId', requireOwner, as
                 `Gas tank returned ${req.params.returnId}`,
                 'GAS_JOB',
                 returnItem.job_id || req.params.returnId,
+                null,
+                'EMPTY',
             );
         }
 
