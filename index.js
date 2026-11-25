@@ -36,6 +36,7 @@ const USER_ROLES = new Set(['owner', 'user']);
 const OWNER_ROLE = 'owner';
 const USER_ROLE = 'user';
 const SESSION_PENDING_OPEN = 'PENDING_OPEN';
+const LOTTERY_PENDING = 'รอเจ้าของร้านยืนยัน';
 const SESSION_OPEN = 'OPEN';
 const SESSION_CLOSED = 'CLOSED';
 const LEGACY_OPEN_STATUS = 'ACTIVE';
@@ -652,6 +653,28 @@ async function initializeCartTables() {
         ON audit_logs (entity_type, entity_id, created_at DESC)
     `);
 
+    await pool.query(`
+        ALTER TABLE lottery_tickets ADD COLUMN IF NOT EXISTS stock_reference INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS submitted_by INTEGER REFERENCES app_users(id);
+        ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS submitted_by_name TEXT;
+        ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS reported_cash_received NUMERIC(12,2);
+        ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS confirmed_by INTEGER REFERENCES app_users(id);
+        ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS confirmed_by_name TEXT;
+        ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ;
+        WITH movements AS (
+            SELECT item_id, delta,
+                SUM(delta) OVER (PARTITION BY item_id ORDER BY id ROWS UNBOUNDED PRECEDING) AS balance_delta,
+                SUM(delta) OVER (PARTITION BY item_id) AS net_delta
+            FROM inventory_movements WHERE item_type = 'LOTTERY'
+        ), peaks AS (
+            SELECT item_id, GREATEST(0, MAX(balance_delta)) - MAX(net_delta) AS peak_offset
+            FROM movements GROUP BY item_id
+        )
+        UPDATE lottery_tickets t SET stock_reference = GREATEST(t.remaining, t.remaining + p.peak_offset)
+        FROM peaks p WHERE p.item_id = t.id::text AND t.stock_reference = 0;
+        UPDATE lottery_tickets SET stock_reference = remaining WHERE stock_reference < remaining;
+    `);
+
     await initializeStoreOperations(pool);
     await ensureDefaultOwner();
     await ensureDefaultStaff();
@@ -788,6 +811,7 @@ function mapLotteryTicket(row) {
         series: row.series || 'Manual',
         price: Number(row.price),
         remaining: Number(row.remaining),
+        stockReference: Number(row.stock_reference ?? row.remaining),
         active: Boolean(row.active),
     };
 }
@@ -1027,7 +1051,8 @@ async function adjustGasStock(client, req, gasItemId, delta, reason, sourceType,
 async function adjustLotteryStock(client, req, ticketId, delta, reason, sourceType, sourceId, reversedFrom = null) {
     const result = await client.query(`
         UPDATE lottery_tickets
-        SET remaining = GREATEST(0, COALESCE(remaining, 0) + $1),
+        SET stock_reference = GREATEST(COALESCE(stock_reference, 0), COALESCE(remaining, 0) + $1),
+            remaining = GREATEST(0, COALESCE(remaining, 0) + $1),
             updated_at = NOW()
         WHERE id = $2
         RETURNING id, number, series, remaining
@@ -1226,6 +1251,12 @@ function mapSaleRecord(row) {
         staffName: row.staff_name,
         paymentMethod: row.payment_method,
         status: row.status,
+        submittedBy: row.submitted_by,
+        submittedByName: row.submitted_by_name,
+        reportedCashReceived: row.reported_cash_received == null ? undefined : Number(row.reported_cash_received),
+        confirmedBy: row.confirmed_by,
+        confirmedByName: row.confirmed_by_name,
+        confirmedAt: row.confirmed_at,
         items: Array.isArray(row.items) ? row.items : [],
         subtotal: Number(row.subtotal),
         discount: Number(row.discount),
@@ -1499,7 +1530,7 @@ async function getClosingSummary(sessionId, client = pool) {
         FROM sales_records
         WHERE session_id = $1
           AND channel = 'LOTTERY'
-          AND status <> 'CANCELLED'
+          AND status NOT IN ('CANCELLED', '${LOTTERY_PENDING}')
     `, [session.session_id]);
 
     const lotteryItemsResult = await client.query(`
@@ -1511,7 +1542,7 @@ async function getClosingSummary(sessionId, client = pool) {
         CROSS JOIN LATERAL jsonb_array_elements(s.items) AS item(value)
         WHERE s.session_id = $1
           AND s.channel = 'LOTTERY'
-          AND s.status <> 'CANCELLED'
+          AND s.status NOT IN ('CANCELLED', '${LOTTERY_PENDING}')
         GROUP BY COALESCE(item.value->>'number', item.value->>'barcode', item.value->>'name')
         ORDER BY quantity DESC, number ASC
         LIMIT 120
@@ -2050,8 +2081,8 @@ app.patch('/api/auth/password', async (req, res) => {
     const currentPassword = String(req.body.currentPassword || req.body.current_password || '');
     const newPassword = String(req.body.newPassword || req.body.new_password || '');
 
-    if (!currentPassword || newPassword.length < 6) {
-        return res.status(400).json({ error: 'currentPassword and newPassword >= 6 are required' });
+    if (!currentPassword || newPassword.length < 6 || newPassword.length > 256) {
+        return res.status(400).json({ error: 'currentPassword and newPassword of 6-256 characters are required' });
     }
 
     const authorization = String(req.headers.authorization || '');
@@ -2111,7 +2142,7 @@ app.post('/api/users', requireOwner, async (req, res) => {
     const password = String(req.body.password || '');
     const role = String(req.body.role || USER_ROLE).trim();
 
-    if (!username || !displayName || password.length < 6 || !USER_ROLES.has(role)) {
+    if (!username || !displayName || password.length < 6 || password.length > 256 || !USER_ROLES.has(role)) {
         return res.status(400).json({ error: 'username, displayName, password >= 6, and valid role are required' });
     }
 
@@ -2157,8 +2188,8 @@ app.patch('/api/users/:userId', requireOwner, async (req, res) => {
         return res.status(400).json({ error: 'valid role is required' });
     }
 
-    if (password !== undefined && password.length < 6) {
-        return res.status(400).json({ error: 'password must be at least 6 characters' });
+    if (password !== undefined && (password.length < 6 || password.length > 256)) {
+        return res.status(400).json({ error: 'password must be 6-256 characters' });
     }
 
     const client = await pool.connect();
@@ -2207,6 +2238,17 @@ app.patch('/api/users/:userId', requireOwner, async (req, res) => {
             WHERE id = $1
             RETURNING id, username, display_name, role, active, created_at, updated_at
         `, values);
+        if (password !== undefined) {
+            // Revoke the target's old sessions. A signed-in owner resetting their
+            // own password keeps only the session making this request.
+            const token = String(req.headers.authorization || '').slice('Bearer '.length).trim();
+            if (userId === req.user.id) {
+                await client.query('DELETE FROM app_user_sessions WHERE user_id = $1 AND token_hash <> $2', [userId, sha256(token)]);
+            } else {
+                await client.query('DELETE FROM app_user_sessions WHERE user_id = $1', [userId]);
+            }
+            await logAudit(client, req, 'UPDATE', 'USER_PASSWORD', userId, 'owner reset password', sanitizeUser(before.rows[0]), sanitizeUser(result.rows[0]));
+        }
         await logAudit(client, req, 'UPDATE', 'USER', userId, req.body.reason || 'update user', sanitizeUser(before.rows[0]), sanitizeUser(result.rows[0]));
         await client.query('COMMIT');
         res.json(sanitizeUser(result.rows[0]));
@@ -2545,6 +2587,11 @@ app.post('/api/app-sessions/:sessionId/close', requireOwner, async (req, res) =>
             return res.status(409).json({ error: 'shop is not open' });
         }
 
+        const pending = await client.query(`SELECT COUNT(*)::int AS count FROM sales_records WHERE session_id = $1 AND channel = 'LOTTERY' AND status = $2`, [session.session_id, LOTTERY_PENDING]);
+        if (pending.rows[0].count > 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'มีรายการหวยรอเจ้าของร้านยืนยัน กรุณายืนยันหรือยกเลิกก่อนปิดร้าน' });
+        }
         const summary = await getClosingSummary(session.session_id, client);
         if (!summary.checks.every((check) => check.confirmed)) {
             await client.query('ROLLBACK');
@@ -2642,6 +2689,10 @@ app.patch('/api/app-sessions/:sessionId/sales/:saleId', requireOwner, async (req
             return res.status(404).json({ error: 'sale not found' });
         }
 
+        if (before.rows[0].channel === 'LOTTERY' && before.rows[0].status === LOTTERY_PENDING) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'กรุณาใช้ปุ่มยืนยันรายการหวยเพื่อยืนยันการรับเงิน' });
+        }
         const updates = [];
         const values = [req.params.saleId, session.session_id];
         const stringFields = [
@@ -4043,7 +4094,7 @@ app.get('/api/lottery/tickets', async (req, res) => {
     try {
         const includeInactive = req.user?.role === OWNER_ROLE && String(req.query.includeInactive || '') === 'true';
         const result = await pool.query(`
-            SELECT id, number, series, price, remaining, active
+            SELECT id, number, series, price, remaining, stock_reference, active
             FROM lottery_tickets
             WHERE ($1::boolean = TRUE OR active = TRUE)
             ORDER BY number ASC
@@ -4100,10 +4151,10 @@ app.post('/api/lottery/tickets', requireOwner, async (req, res) => {
             VALUES ($1, $2, $3, 0, TRUE)
             ON CONFLICT (number)
             DO UPDATE SET series = EXCLUDED.series, price = EXCLUDED.price, active = TRUE, updated_at = NOW()
-            RETURNING id, number, series, price, remaining, active
+            RETURNING id, number, series, price, remaining, stock_reference, active
         `, [number, series, price]);
         await adjustLotteryStock(client, req, ticketResult.rows[0].id, quantity, reason, 'LOTTERY_STOCK', ticketResult.rows[0].id);
-        const result = await client.query('SELECT id, number, series, price, remaining, active FROM lottery_tickets WHERE id = $1', [ticketResult.rows[0].id]);
+        const result = await client.query('SELECT id, number, series, price, remaining, stock_reference, active FROM lottery_tickets WHERE id = $1', [ticketResult.rows[0].id]);
         await logAudit(client, req, 'UPSERT', 'LOTTERY_TICKET', ticketResult.rows[0].id, reason, null, mapLotteryTicket(result.rows[0]));
         await client.query('COMMIT');
         res.status(201).json(mapLotteryTicket(result.rows[0]));
@@ -4121,7 +4172,7 @@ app.patch('/api/lottery/tickets/:ticketId', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const before = await client.query('SELECT id, number, series, price, remaining, active FROM lottery_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
+        const before = await client.query('SELECT id, number, series, price, remaining, stock_reference, active FROM lottery_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
         if (!before.rows[0]) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'lottery ticket not found' });
@@ -4165,7 +4216,7 @@ app.patch('/api/lottery/tickets/:ticketId', requireOwner, async (req, res) => {
             `, values);
         }
 
-        const result = await client.query('SELECT id, number, series, price, remaining, active FROM lottery_tickets WHERE id = $1', [ticketId]);
+        const result = await client.query('SELECT id, number, series, price, remaining, stock_reference, active FROM lottery_tickets WHERE id = $1', [ticketId]);
         await logAudit(client, req, 'UPDATE', 'LOTTERY_TICKET', ticketId, req.body.reason || 'update lottery ticket', mapLotteryTicket(before.rows[0]), mapLotteryTicket(result.rows[0]));
         await client.query('COMMIT');
         res.json(mapLotteryTicket(result.rows[0]));
@@ -4186,7 +4237,7 @@ app.delete('/api/lottery/tickets/:ticketId', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const before = await client.query('SELECT id, number, series, price, remaining, active FROM lottery_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
+        const before = await client.query('SELECT id, number, series, price, remaining, stock_reference, active FROM lottery_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
         if (!before.rows[0]) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'lottery ticket not found' });
@@ -4196,7 +4247,7 @@ app.delete('/api/lottery/tickets/:ticketId', requireOwner, async (req, res) => {
             UPDATE lottery_tickets
             SET active = FALSE, updated_at = NOW()
             WHERE id = $1
-            RETURNING id, number, series, price, remaining, active
+            RETURNING id, number, series, price, remaining, stock_reference, active
         `, [ticketId]);
         await logAudit(client, req, 'DELETE', 'LOTTERY_TICKET', ticketId, req.body.reason || 'deactivate lottery ticket', mapLotteryTicket(before.rows[0]), mapLotteryTicket(result.rows[0]));
         await client.query('COMMIT');
@@ -4340,6 +4391,33 @@ app.delete('/api/lottery-sessions/:sessionId/cart', async (req, res) => {
     }
 });
 
+app.post('/api/app-sessions/:sessionId/lottery/:saleId/confirm', requireOwner, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const session = await ensureOpenAppSession(req.params.sessionId, client);
+        const { rows: [sale] } = await client.query(
+            "SELECT * FROM sales_records WHERE id = $1 AND session_id = $2 AND channel = 'LOTTERY' FOR UPDATE",
+            [req.params.saleId, session.session_id]);
+        if (!sale) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'ไม่พบรายการหวย' }); }
+        if (sale.status !== LOTTERY_PENDING) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'รายการนี้ไม่ได้รอการยืนยันแล้ว' }); }
+        const received = sale.payment_method === 'PromptPay' ? Number(sale.total) : Number(req.body.cashReceived);
+        if (!Number.isFinite(received) || received < Number(sale.total) || received > 9999999999.99) {
+            await client.query('ROLLBACK'); return res.status(400).json({ error: 'เงินที่ตรวจรับจริงต้องไม่น้อยกว่ายอดรายการ' });
+        }
+        const { rows: [result] } = await client.query(`UPDATE sales_records SET status = 'completed',
+            cash_received = $1, change = $1 - total, confirmed_by = $2, confirmed_by_name = $3,
+            confirmed_at = NOW(), updated_at = NOW() WHERE id = $4 RETURNING *`,
+            [received, req.user.id, req.user.displayName || req.user.username, sale.id]);
+        await client.query("DELETE FROM app_session_closing_checks WHERE session_id = $1 AND section = 'LOTTERY'", [session.session_id]);
+        await logAudit(client, req, 'CONFIRM_PAYMENT', 'LOTTERY_SALE', sale.id, 'owner verified lottery payment', mapSaleRecord(sale), mapSaleRecord(result));
+        await client.query('COMMIT');
+        res.json(mapSaleRecord(result));
+    } catch (error) {
+        await client.query('ROLLBACK'); res.status(error.statusCode || 500).json({ error: error.message || 'Database error' });
+    } finally { client.release(); }
+});
+
 app.post('/api/app-sessions/:sessionId/lottery/checkout', async (req, res) => {
     const client = await pool.connect();
     try {
@@ -4352,16 +4430,17 @@ app.post('/api/app-sessions/:sessionId/lottery/checkout', async (req, res) => {
             return res.status(400).json({ error: 'lottery cart is empty' });
         }
 
-        const paymentMethod = req.body.paymentMethod || 'cash';
+        const paymentMethod = req.body.paymentMethod === 'PromptPay' ? 'PromptPay' : 'เงินสด';
+        const confirmed = req.user.role === OWNER_ROLE;
         const subtotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
         const cashReceived = paymentMethod === 'PromptPay' ? subtotal : Number(req.body.cashReceived || 0);
-        if (paymentMethod !== 'PromptPay' && cashReceived < subtotal) {
+        if (!Number.isFinite(cashReceived) || cashReceived < subtotal) {
             await client.query('ROLLBACK');
             return res.status(409).json({ error: 'cash received is not enough', shortage: subtotal - cashReceived });
         }
 
         const createdAt = new Date();
-        const saleId = createSaleId('LOTTERY', createdAt);
+        const saleId = `${createSaleId('LOTTERY', createdAt)}-${crypto.randomBytes(6).toString('hex')}`;
         for (const item of cart) {
             const ticketResult = await client.query('SELECT remaining FROM lottery_tickets WHERE id = $1 FOR UPDATE', [Number(item.id)]);
             const remaining = Number(ticketResult.rows[0]?.remaining || 0);
@@ -4377,9 +4456,9 @@ app.post('/api/app-sessions/:sessionId/lottery/checkout', async (req, res) => {
             channel: 'LOTTERY',
             createdAt,
             customerName: req.body.customerName || 'walk-in',
-            staffName: req.body.cashierName || req.user.displayName || req.user.username,
+            staffName: req.user.role === OWNER_ROLE ? (req.body.cashierName || req.user.displayName || req.user.username) : (req.user.displayName || req.user.username),
             paymentMethod,
-            status: 'completed',
+            status: confirmed ? 'completed' : LOTTERY_PENDING,
             items: cart.map((item) => ({
                 id: item.id,
                 ticketId: item.id,
@@ -4393,33 +4472,24 @@ app.post('/api/app-sessions/:sessionId/lottery/checkout', async (req, res) => {
             subtotal,
             discount: 0,
             total: subtotal,
-            cashReceived,
-            change: Math.max(0, cashReceived - subtotal),
+            cashReceived: confirmed ? cashReceived : 0,
+            change: confirmed ? Math.max(0, cashReceived - subtotal) : 0,
             note: req.body.note || 'lottery sale',
         };
 
         await insertSaleRecord(client, sessionId, sale);
+        await client.query(`UPDATE sales_records SET submitted_by = $1, submitted_by_name = $2,
+            reported_cash_received = $3, confirmed_by = $4, confirmed_by_name = $5, confirmed_at = $6
+            WHERE id = $7`, [req.user.id, req.user.displayName || req.user.username, cashReceived,
+            confirmed ? req.user.id : null, confirmed ? (req.user.displayName || req.user.username) : null,
+            confirmed ? createdAt : null, saleId]);
+        await client.query("DELETE FROM app_session_closing_checks WHERE session_id = $1 AND section = 'LOTTERY'", [sessionId]);
         await client.query('DELETE FROM lottery_cart_items WHERE session_id = $1', [sessionId]);
         await client.query('UPDATE lottery_cart_sessions SET updated_at = NOW() WHERE session_id = $1', [sessionId]);
         await logAudit(client, req, 'CHECKOUT', 'LOTTERY_SALE', saleId, 'lottery checkout', null, sale);
         await client.query('COMMIT');
         res.status(201).json({
-            sale: mapSaleRecord({
-                id: sale.id,
-                channel: sale.channel,
-                created_at: sale.createdAt,
-                customer_name: sale.customerName,
-                staff_name: sale.staffName,
-                payment_method: sale.paymentMethod,
-                status: sale.status,
-                items: sale.items,
-                subtotal: sale.subtotal,
-                discount: sale.discount,
-                total: sale.total,
-                cash_received: sale.cashReceived,
-                change: sale.change,
-                note: sale.note,
-            }),
+            sale: mapSaleRecord((await client.query('SELECT * FROM sales_records WHERE id = $1', [saleId])).rows[0]),
             cart: await getLotteryCartResponse(sessionId, client),
         });
     } catch (err) {
