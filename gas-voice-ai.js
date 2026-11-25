@@ -92,7 +92,7 @@ function validateExtraction(raw, text) {
     return draft;
 }
 
-function createGasVoiceAI({ env = process.env, fetchImpl = fetch, now = Date.now } = {}) {
+function createGasVoiceAI({ env = process.env, fetchImpl = fetch, now = Date.now, reportFailure = entry => console.warn(JSON.stringify(entry)) } = {}) {
     const account = env.CLOUDFLARE_ACCOUNT_ID || '';
     const token = env.CLOUDFLARE_API_TOKEN || '';
     // This opt-in flag is set only after verifying the account uses Workers Free.
@@ -117,6 +117,9 @@ function createGasVoiceAI({ env = process.env, fetchImpl = fetch, now = Date.now
             minutes.set(userId, user);
             dailyCount++;
             active++;
+            const started = now();
+            let providerStatus;
+            let providerCodes;
             try {
                 const response = await fetchImpl(`https://api.cloudflare.com/client/v4/accounts/${account}/ai/v1/chat/completions`, {
                     method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -128,13 +131,22 @@ function createGasVoiceAI({ env = process.env, fetchImpl = fetch, now = Date.now
                         response_format: { type: 'json_schema', json_schema: schema },
                     }),
                 });
-                if (!response.ok) throw fault(response.status === 429 ? 429 : 502, 'VOICE_AI_UNAVAILABLE', 'AI ยังไม่พร้อมหรือโควต้าหมด ใช้การแยกคำพื้นฐานได้');
+                providerStatus = response.status;
+                if (!response.ok) {
+                    // Numeric error codes help diagnose configuration without logging provider text.
+                    const failure = typeof response.json === 'function' ? await response.json().catch(() => null) : null;
+                    providerCodes = Array.isArray(failure?.errors) ? failure.errors.map(item => item?.code).filter(Number.isSafeInteger).slice(0, 3) : undefined;
+                    throw fault(response.status === 429 ? 429 : 502, 'VOICE_AI_UNAVAILABLE', 'AI ยังไม่พร้อมหรือโควต้าหมด ใช้การแยกคำพื้นฐานได้');
+                }
                 const payload = await response.json();
                 const result = payload.result ?? payload;
                 const content = result.choices?.[0]?.message?.content ?? result.response;
                 const raw = typeof content === 'string' ? JSON.parse(content) : content;
                 return validateExtraction(raw, text.trim());
             } catch (error) {
+                reportFailure({ event: 'gas_voice_ai_failure', code: error.code === 'VOICE_AI_INVALID' ? 'VOICE_AI_INVALID' : 'VOICE_AI_UNAVAILABLE',
+                    providerStatus, providerCodes, durationMs: Math.max(0, now() - started),
+                    timedOut: error.name === 'TimeoutError' });
                 if (error.status) throw error;
                 throw fault(502, 'VOICE_AI_UNAVAILABLE', 'AI ตอบกลับไม่สำเร็จ ใช้การแยกคำพื้นฐานได้');
             } finally { active--; }

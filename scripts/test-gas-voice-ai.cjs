@@ -88,6 +88,20 @@ test('invalid user text does not consume an inference request', async () => {
     assert.equal(calls, 0);
 });
 
+test('failure diagnostics contain only safe status, numeric codes and timing', async () => {
+    const entries = [];
+    const service = createGasVoiceAI({ env, reportFailure: entry => entries.push(entry), fetchImpl: async () => ({
+        ok: false, status: 400, json: async () => ({ errors: [
+            { code: 5004, message: `${text} test-only-token` }, { code: 'test-only-token' },
+        ] }),
+    }) });
+    await assert.rejects(service.parse(text, 1));
+    assert.equal(entries[0].providerStatus, 400);
+    assert.deepEqual(entries[0].providerCodes, [5004]);
+    assert.equal(JSON.stringify(entries).includes('test-only-token'), false);
+    assert.equal(JSON.stringify(entries).includes('คุณเจเจ'), false);
+});
+
 test('rate and daily limits block requests before sending them, then reset on the next UTC day', async () => {
     let time = Date.UTC(2026, 10, 25);
     let calls = 0;
