@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const { initializeStoreOperations, registerStoreOperations, transferClosingTotals } = require('./store-operations');
 
 const app = express();
 app.use(cors());
@@ -11,7 +12,7 @@ const scanSessions = new Map();
 let scanEventId = 1;
 const port = Number(process.env.PORT || 5000);
 
-const pool = new Pool(process.env.DATABASE_URL
+const databaseConfig = process.env.DATABASE_URL
     ? { connectionString: process.env.DATABASE_URL }
     : {
         user: process.env.DB_USER || process.env.PGUSER,
@@ -19,7 +20,17 @@ const pool = new Pool(process.env.DATABASE_URL
         database: process.env.DB_NAME || process.env.PGDATABASE,
         password: process.env.DB_PASSWORD || process.env.PGPASSWORD,
         port: process.env.DB_PORT || process.env.PGPORT,
-    });
+    };
+const pool = new Pool({ ...databaseConfig, connectionTimeoutMillis: 5000 });
+
+function logDatabaseError(context, error) {
+    const causes = error.errors?.length ? error.errors : [error];
+    for (const cause of causes) {
+        console.error(`${context}${cause.code ? ` [${cause.code}]` : ''}:`, cause.message || cause.name);
+    }
+}
+
+pool.on('error', (error) => logDatabaseError('Idle database connection failed', error));
 
 const USER_ROLES = new Set(['owner', 'user']);
 const OWNER_ROLE = 'owner';
@@ -28,7 +39,7 @@ const SESSION_PENDING_OPEN = 'PENDING_OPEN';
 const SESSION_OPEN = 'OPEN';
 const SESSION_CLOSED = 'CLOSED';
 const LEGACY_OPEN_STATUS = 'ACTIVE';
-const CLOSING_SECTIONS = ['POS', 'GAS', 'LOTTERY', 'TOPUP', 'STOCK'];
+const CLOSING_SECTIONS = ['POS', 'GAS', 'LOTTERY', 'TOPUP', 'TRANSFER', 'STOCK'];
 const PASSWORD_ITERATIONS = 120000;
 const SESSION_TTL_DAYS = 14;
 
@@ -194,7 +205,7 @@ async function initializeCartTables() {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS products (
             id SERIAL PRIMARY KEY,
-            barcode TEXT NOT NULL UNIQUE,
+            barcode TEXT UNIQUE,
             name TEXT NOT NULL,
             price NUMERIC(12, 2) NOT NULL DEFAULT 0,
             cost NUMERIC(12, 2) NOT NULL DEFAULT 0,
@@ -207,6 +218,7 @@ async function initializeCartTables() {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
+    await pool.query('ALTER TABLE products ALTER COLUMN barcode DROP NOT NULL');
 
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS min_stock INTEGER NOT NULL DEFAULT 5`);
     await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'piece'`);
@@ -283,17 +295,7 @@ async function initializeCartTables() {
         )
     `);
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS members (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL UNIQUE,
-            note TEXT NOT NULL DEFAULT '',
-            active BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    `);
+
 
     await pool.query(`
         CREATE TABLE IF NOT EXISTS app_sessions (
@@ -637,6 +639,7 @@ async function initializeCartTables() {
         ON audit_logs (entity_type, entity_id, created_at DESC)
     `);
 
+    await initializeStoreOperations(pool);
     await ensureDefaultOwner();
     await ensureDefaultStaff();
 }
@@ -682,16 +685,6 @@ function mapStaff(row) {
     };
 }
 
-function mapMember(row) {
-    return {
-        id: String(row.id),
-        name: row.name,
-        phone: row.phone,
-        note: row.note || '',
-        active: Boolean(row.active),
-    };
-}
-
 function normalizeAppSessionStatus(status) {
     return status === LEGACY_OPEN_STATUS ? SESSION_OPEN : status;
 }
@@ -716,7 +709,7 @@ function mapAppSession(row) {
 function mapProduct(row) {
     return {
         id: Number(row.id),
-        barcode: row.barcode,
+        barcode: row.barcode ?? '',
         name: row.name,
         price: Number(row.price),
         cost: row.cost === undefined || row.cost === null ? undefined : Number(row.cost),
@@ -747,8 +740,9 @@ function productDraftFromBody(body) {
     };
 }
 
-function validateProductDraft(draft) {
-    return Boolean(draft.barcode && draft.name && Number.isFinite(draft.price) && draft.price > 0);
+function validateProductDraft(draft, allowMissingBarcode = false) {
+    return Boolean((allowMissingBarcode || draft.barcode) && draft.name &&
+        Number.isFinite(draft.price) && (allowMissingBarcode ? draft.price >= 0 : draft.price > 0));
 }
 
 function mapProductRegistrationRequest(row) {
@@ -1111,9 +1105,10 @@ async function createProductFromDraft(client, req, draft, reason) {
             unit = EXCLUDED.unit,
             active = TRUE,
             updated_at = NOW()
+        WHERE NOT products.active
         RETURNING id, barcode, name, price, cost, stock, category_id, min_stock, unit, active
     `, [
-        draft.barcode,
+        draft.barcode || null,
         draft.name,
         draft.price,
         draft.cost,
@@ -1122,6 +1117,9 @@ async function createProductFromDraft(client, req, draft, reason) {
         draft.minStock,
         draft.unit,
     ]);
+    if (!productResult.rows[0]) {
+        throw Object.assign(new Error('Barcode already exists'), { statusCode: 409 });
+    }
     const product = { ...productResult.rows[0], category: draft.category || null };
 
     if (draft.stock > 0) {
@@ -1642,7 +1640,9 @@ async function getClosingSummary(sessionId, client = pool) {
     const gasSoldQuantity = gasItemsResult.rows.reduce((sum, row) => sum + Number(row.quantity), 0);
     const topupTotal = topupResult.rows.reduce((sum, row) => sum + Number(row.total), 0);
     const topupCount = topupResult.rows.reduce((sum, row) => sum + Number(row.order_count), 0);
-    const checks = await getClosingChecks(session.session_id, client);
+    const transfers = await transferClosingTotals(client, session.session_id);
+    const checks = (await getClosingChecks(session.session_id, client))
+        .filter((check) => check.section !== 'TRANSFER' || transfers.records > 0);
     const readyToClose = isOpenSessionStatus(session.status) && checks.every((check) => check.confirmed);
 
     return {
@@ -1651,6 +1651,7 @@ async function getClosingSummary(sessionId, client = pool) {
         checks,
         readyToClose,
         sections: {
+            transfers,
             pos: {
                 billCount: Number(posTotalsResult.rows[0].bill_count),
                 itemCount: posItemsResult.rows.reduce((sum, row) => sum + Number(row.quantity), 0),
@@ -2016,6 +2017,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.use('/api', requireAuth);
+registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession, adjustProductStock, logAudit });
 
 app.get('/api/auth/me', (req, res) => {
     res.json({ user: req.user });
@@ -2355,142 +2357,6 @@ app.delete('/api/staff/:staffId', requireOwner, async (req, res) => {
         await logAudit(client, req, 'DELETE', 'STAFF', staffId, req.body.reason || 'deactivate staff', mapStaff(before.rows[0]), mapStaff(result.rows[0]));
         await client.query('COMMIT');
         res.json(mapStaff(result.rows[0]));
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error(err.message);
-        res.status(500).json({ error: 'Database error' });
-    } finally {
-        client.release();
-    }
-});
-
-app.get('/api/members', async (req, res) => {
-    try {
-        const phone = String(req.query.phone || '').replace(/\D/g, '');
-        const params = [];
-        let where = 'WHERE active = TRUE';
-        if (phone) {
-            params.push(phone);
-            where += ` AND phone = $${params.length}`;
-        }
-        const result = await pool.query(`
-            SELECT id, name, phone, note, active
-            FROM members
-            ${where}
-            ORDER BY id DESC
-            LIMIT 100
-        `, params);
-        res.json(result.rows.map(mapMember));
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).json({ error: 'Database error' });
-    }
-});
-
-app.post('/api/members', requireOwner, async (req, res) => {
-    const name = String(req.body.name || '').trim();
-    const phone = String(req.body.phone || '').replace(/\D/g, '');
-    const note = String(req.body.note || '').trim();
-    if (!name || !/^0\d{9}$/.test(phone)) {
-        return res.status(400).json({ error: 'member name and 10 digit phone are required' });
-    }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const result = await client.query(`
-            INSERT INTO members (name, phone, note, active)
-            VALUES ($1, $2, $3, TRUE)
-            ON CONFLICT (phone)
-            DO UPDATE SET name = EXCLUDED.name, note = EXCLUDED.note, active = TRUE, updated_at = NOW()
-            RETURNING id, name, phone, note, active
-        `, [name, phone, note]);
-        await logAudit(client, req, 'UPSERT', 'MEMBER', result.rows[0].id, 'upsert member', null, mapMember(result.rows[0]));
-        await client.query('COMMIT');
-        res.status(201).json(mapMember(result.rows[0]));
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error(err.message);
-        res.status(500).json({ error: 'Database error' });
-    } finally {
-        client.release();
-    }
-});
-
-app.patch('/api/members/:memberId', requireOwner, async (req, res) => {
-    const memberId = Number(req.params.memberId);
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const before = await client.query('SELECT id, name, phone, note, active FROM members WHERE id = $1 FOR UPDATE', [memberId]);
-        if (!before.rows[0]) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'member not found' });
-        }
-
-        const updates = [];
-        const values = [memberId];
-        ['name', 'note'].forEach((field) => {
-            if (req.body[field] !== undefined) {
-                values.push(String(req.body[field] || '').trim());
-                updates.push(`${field} = $${values.length}`);
-            }
-        });
-        if (req.body.phone !== undefined) {
-            values.push(String(req.body.phone || '').replace(/\D/g, ''));
-            updates.push(`phone = $${values.length}`);
-        }
-        if (req.body.active !== undefined) {
-            values.push(Boolean(req.body.active));
-            updates.push(`active = $${values.length}`);
-        }
-
-        if (updates.length === 0) {
-            await client.query('ROLLBACK');
-            return res.json(mapMember(before.rows[0]));
-        }
-
-        const result = await client.query(`
-            UPDATE members
-            SET ${updates.join(', ')}, updated_at = NOW()
-            WHERE id = $1
-            RETURNING id, name, phone, note, active
-        `, values);
-        await logAudit(client, req, 'UPDATE', 'MEMBER', memberId, req.body.reason || 'update member', mapMember(before.rows[0]), mapMember(result.rows[0]));
-        await client.query('COMMIT');
-        res.json(mapMember(result.rows[0]));
-    } catch (err) {
-        await client.query('ROLLBACK');
-        if (err.code === '23505') {
-            return res.status(409).json({ error: 'phone already exists' });
-        }
-        console.error(err.message);
-        res.status(500).json({ error: 'Database error' });
-    } finally {
-        client.release();
-    }
-});
-
-app.delete('/api/members/:memberId', requireOwner, async (req, res) => {
-    const memberId = Number(req.params.memberId);
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const before = await client.query('SELECT id, name, phone, note, active FROM members WHERE id = $1 FOR UPDATE', [memberId]);
-        if (!before.rows[0]) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'member not found' });
-        }
-
-        const result = await client.query(`
-            UPDATE members
-            SET active = FALSE, updated_at = NOW()
-            WHERE id = $1
-            RETURNING id, name, phone, note, active
-        `, [memberId]);
-        await logAudit(client, req, 'DELETE', 'MEMBER', memberId, req.body.reason || 'deactivate member', mapMember(before.rows[0]), mapMember(result.rows[0]));
-        await client.query('COMMIT');
-        res.json(mapMember(result.rows[0]));
     } catch (err) {
         await client.query('ROLLBACK');
         console.error(err.message);
@@ -3309,8 +3175,8 @@ app.get('/api/products', async (req, res) => {
 app.post('/api/products', requireOwner, async (req, res) => {
     const draft = productDraftFromBody(req.body);
 
-    if (!validateProductDraft(draft)) {
-        return res.status(400).json({ error: "barcode, name, and price are required" });
+    if (!validateProductDraft(draft, true)) {
+        return res.status(400).json({ error: "name and a valid price are required" });
     }
 
     const client = await pool.connect();
@@ -3356,7 +3222,8 @@ app.patch('/api/products/:productId', requireOwner, async (req, res) => {
         const values = [productId];
         ['barcode', 'name', 'unit'].forEach((field) => {
             if (req.body[field] !== undefined) {
-                values.push(String(req.body[field] || '').trim());
+                const value = String(req.body[field] || '').trim();
+                values.push(field === 'barcode' ? value || null : value);
                 updates.push(`${field} = $${values.length}`);
             }
         });
@@ -3744,8 +3611,8 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
         return res.status(400).json({ error: "gas items are required" });
     }
 
-    if (!customerName || !phone || !address) {
-        return res.status(400).json({ error: "customer name, phone, and address are required" });
+    if (!customerName || !address) {
+        return res.status(400).json({ error: "customer name and address are required" });
     }
 
     const client = await pool.connect();
@@ -3786,7 +3653,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
             await adjustGasStock(client, req, gasItemId, -quantity, `Gas job ${jobId}`, 'GAS_JOB', jobId, null, 'FULL');
             normalizedItems.push({
                 id: item.id,
-                name: item.name,
+                name: ['สยาม', 'ปตท'].includes(req.body.brand) ? req.body.brand + ' ' + item.name : item.name,
                 operation: item.operation,
                 quantity,
                 price: Number(item.price),
@@ -4152,6 +4019,32 @@ app.get('/api/lottery/tickets', async (req, res) => {
     }
 });
 
+app.post('/api/lottery/books', requireOwner, async (req, res) => {
+    const { quantity, price } = req.body;
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 10000 || !Number.isFinite(price) || price <= 0) {
+        return res.status(400).json({ error: 'invalid quantity or price' });
+    }
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (let suffix = 0; suffix < 100; suffix++) {
+            const number = String(suffix).padStart(2, '0');
+            const ticket = await client.query(`
+                INSERT INTO lottery_tickets (number, series, price, remaining, active)
+                VALUES ($1, 'เลขท้าย', $2, 0, TRUE)
+                ON CONFLICT (number) DO UPDATE SET price = EXCLUDED.price, active = TRUE
+                RETURNING id`, [number, price]);
+            const id = ticket.rows[0].id;
+            await adjustLotteryStock(client, req, id, quantity, 'รับสลากเข้าเล่ม', 'LOTTERY_STOCK', id);
+        }
+        await client.query('COMMIT');
+        res.status(201).json({ total: quantity * 100 });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: 'could not receive lottery book' });
+    } finally { client.release(); }
+});
+
 app.post('/api/lottery/tickets', requireOwner, async (req, res) => {
     const number = String(req.body.number || '').replace(/\D/g, '').slice(0, 6);
     const series = String(req.body.series || 'Manual').trim() || 'Manual';
@@ -4293,7 +4186,7 @@ app.get('/api/lottery-sessions/:sessionId/cart', async (req, res) => {
 
 app.post('/api/lottery-sessions/:sessionId/cart/items', async (req, res) => {
     const number = String(req.body.number || '').replace(/\D/g, '').slice(0, 6);
-    if (!/^\d{6}$/.test(number)) {
+    if (!/^(?:\d{2}|\d{6})$/.test(number)) {
         return res.status(400).json({ error: 'valid lottery number is required' });
     }
 
@@ -4709,7 +4602,7 @@ app.post('/api/pos-sessions/:sessionId/cart/scan', async (req, res) => {
                 p.price,
                 p.stock
             FROM products p
-            WHERE p.active = TRUE
+            WHERE p.active = TRUE AND p.price > 0
               AND (LOWER(p.barcode) = $1 OR LOWER(p.name) LIKE $2)
             ORDER BY CASE WHEN LOWER(p.barcode) = $1 THEN 0 ELSE 1 END, p.id ASC
             LIMIT 1
@@ -4741,7 +4634,7 @@ app.post('/api/pos-sessions/:sessionId/cart/scan', async (req, res) => {
                 name = EXCLUDED.name,
                 price = EXCLUDED.price,
                 updated_at = NOW()
-        `, [sessionId, product.id, product.barcode, product.name, product.price]);
+        `, [sessionId, product.id, product.barcode ?? '', product.name, product.price]);
 
         await client.query('UPDATE pos_cart_sessions SET updated_at = NOW() WHERE session_id = $1', [sessionId]);
         const response = await getCartResponse(sessionId, client);
@@ -4872,16 +4765,34 @@ app.get('/api/scan-sessions/:sessionId/events', (req, res) => {
     res.json(events.filter((event) => event.id > after));
 });
 
-app.get('/health', (_req, res) => {
-    res.json({ ok: true });
+app.get('/health', async (_req, res) => {
+    try {
+        await pool.query({ text: 'SELECT 1', query_timeout: 3000 });
+        res.json({ ok: true });
+    } catch (error) {
+        logDatabaseError('Database health check failed', error);
+        res.status(503).json({ ok: false, error: 'Database unavailable' });
+    }
 });
 
-initializeCartTables()
-    .catch((err) => {
-        console.error('Could not initialize backend database:', err.message);
-    })
-    .finally(() => {
-        app.listen(port, () => {
-            console.log(`Server is running on port ${port} 🚀`);
-        });
+async function start() {
+    try {
+        await initializeCartTables();
+    } catch (error) {
+        logDatabaseError('Could not initialize backend database', error);
+        process.exitCode = 1;
+        await pool.end();
+        return;
+    }
+
+    const server = app.listen(port, () => {
+        console.log(`Server is running on port ${port} 🚀`);
     });
+    server.on('error', (error) => {
+        console.error(`Could not start backend on port ${port}:`, error.message);
+        process.exitCode = 1;
+        void pool.end();
+    });
+}
+
+void start();
