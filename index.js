@@ -4,6 +4,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const { initializeStoreOperations, registerStoreOperations, transferClosingTotals, transferRecordsByDateRange } = require('./store-operations');
+const { registerGasVoiceAI } = require('./gas-voice-ai');
 
 const app = express();
 app.use(cors());
@@ -2062,6 +2063,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.use('/api', requireAuth);
+registerGasVoiceAI(app);
 registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession, adjustProductStock, logAudit });
 
 app.get('/api/auth/me', (req, res) => {

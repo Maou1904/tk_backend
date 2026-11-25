@@ -51,7 +51,7 @@ async function start() {
     await new Promise(resolve => server.close(resolve));
     base = `http://127.0.0.1:${port}`;
     const env = { ...process.env, PORT: String(port), NODE_ENV: 'production',
-        DEFAULT_OWNER_USERNAME: 'password_qa', DEFAULT_OWNER_PASSWORD: password, TZ: 'Asia/Bangkok' };
+        DEFAULT_OWNER_USERNAME: 'password_qa', DEFAULT_OWNER_PASSWORD: password, TZ: 'Asia/Bangkok', GAS_VOICE_AI_ENABLED: 'false' };
     if (connection.connectionString) {
         const url = new URL(connection.connectionString);
         url.pathname = `/${database}`;
@@ -75,10 +75,14 @@ async function start() {
     client = new Client({ ...connection, database });
     await client.connect();
     await start();
+    await api('/api/gas/voice/status', undefined, 'GET', 401);
+    await api('/api/gas/voice/parse', { text: 'ทดสอบ' }, 'POST', 401);
     const login = async (username, password, expected = 200) => api('/api/auth/login', { username, password }, 'POST', expected);
     const owner = await login('password_qa', password);
     const ownerOther = await login('password_qa', password);
     token = owner.token;
+    assert.deepEqual(await api('/api/gas/voice/status'), { enabled: false, provider: 'rules' });
+    await api('/api/gas/voice/parse', { text: 'ทดสอบ' }, 'POST', 503);
     const initial = crypto.randomBytes(24).toString('hex');
     const ownNew = crypto.randomBytes(24).toString('hex');
     const resetNew = crypto.randomBytes(24).toString('hex');
