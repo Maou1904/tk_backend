@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const crypto = require('crypto');
-const { initializeStoreOperations, registerStoreOperations, transferClosingTotals } = require('./store-operations');
+const { initializeStoreOperations, registerStoreOperations, transferClosingTotals, transferRecordsByDateRange } = require('./store-operations');
 
 const app = express();
 app.use(cors());
@@ -2576,9 +2576,14 @@ app.post('/api/app-sessions/:sessionId/close', requireOwner, async (req, res) =>
 app.get('/api/analytics/sales', async (req, res) => {
     try {
         const range = resolveAnalyticsRange(req.query);
+        const [sales, transfers] = await Promise.all([
+            getCombinedSaleRecordsByDateRange(range.startDate, range.endDate),
+            transferRecordsByDateRange(pool, range.startDate, range.endDate),
+        ]);
         res.json({
             ...range,
-            sales: await getCombinedSaleRecordsByDateRange(range.startDate, range.endDate),
+            sales,
+            transfers,
         });
     } catch (err) {
         console.error(err.message);

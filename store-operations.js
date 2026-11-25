@@ -129,6 +129,17 @@ async function transferClosingTotals(client, sessionId) {
     return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, Number(value)]));
 }
 
+async function transferRecordsByDateRange(client, startDate, endDate) {
+    const { rows } = await client.query(`
+        SELECT t.*, COALESCE(u.display_name, u.username, 'system') AS staff
+        FROM cash_transfers t LEFT JOIN app_users u ON u.id = t.created_by
+        WHERE t.created_at >= ($1::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+          AND t.created_at < ($2::date::timestamp AT TIME ZONE 'Asia/Bangkok')
+        ORDER BY t.created_at DESC, t.id DESC
+    `, [startDate, endDate]);
+    return rows.map(transfer);
+}
+
 function itemQuantities(value, key, minimum, maximum = 1000000) {
     if (!Array.isArray(value) || value.length === 0 || value.length > 200) {
         throw problem(400, 'กรุณากรอกสินค้า 1–200 รายการ');
@@ -603,4 +614,4 @@ function registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession
     }));
 }
 
-module.exports = { initializeStoreOperations, registerStoreOperations, transferClosingTotals };
+module.exports = { initializeStoreOperations, registerStoreOperations, transferClosingTotals, transferRecordsByDateRange };
