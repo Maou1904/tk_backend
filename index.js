@@ -3646,7 +3646,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
         await client.query('BEGIN');
         const session = await ensureOpenAppSession(req.params.sessionId, client);
         const createdAt = new Date();
-        const jobId = createSaleId('GAS', createdAt);
+        const jobId = `${createSaleId('GAS', createdAt)}-${crypto.randomBytes(6).toString('hex')}`;
         const normalizedItems = [];
         let subtotal = 0;
         let totalTankQuantity = 0;
