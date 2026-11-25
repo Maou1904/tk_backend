@@ -421,6 +421,19 @@ async function initializeCartTables() {
 
     await pool.query(`ALTER TABLE gas_items ADD COLUMN IF NOT EXISTS full_stock INTEGER NOT NULL DEFAULT 0`);
     await pool.query(`ALTER TABLE gas_items ADD COLUMN IF NOT EXISTS empty_stock INTEGER NOT NULL DEFAULT 0`);
+    await pool.query(`ALTER TABLE gas_items ADD COLUMN IF NOT EXISTS brand TEXT NOT NULL DEFAULT '' CHECK (brand IN ('', 'สยาม', 'ปตท'))`);
+    // Only classify legacy rows when their existing labels identify one brand.
+    // Unlabelled/shared stock must be assigned by the owner, never duplicated.
+    await pool.query(`
+        WITH legacy AS (
+            SELECT id,
+                concat_ws(' ', id, name, operation) ~* '(สยาม|(^|[^a-z])siam([^a-z]|$))' AS siam,
+                concat_ws(' ', id, name, operation) ~* '(ปตท|(^|[^a-z])ptt([^a-z]|$))' AS ptt
+            FROM gas_items WHERE brand = ''
+        )
+        UPDATE gas_items g SET brand = CASE WHEN legacy.siam THEN 'สยาม' ELSE 'ปตท' END
+        FROM legacy WHERE g.id = legacy.id AND legacy.siam <> legacy.ptt
+    `);
     await pool.query(`
         UPDATE gas_items
         SET full_stock = CASE
@@ -955,7 +968,7 @@ async function adjustGasStock(client, req, gasItemId, delta, reason, sourceType,
     const normalizedDelta = Math.trunc(Number(delta));
     const normalizedStockKind = normalizeGasStockKind(stockKind);
     const currentResult = await client.query(`
-        SELECT id, name, operation, stock, full_stock, empty_stock
+        SELECT id, name, operation, brand, stock, full_stock, empty_stock
         FROM gas_items
         WHERE id = $1
         FOR UPDATE
@@ -993,7 +1006,7 @@ async function adjustGasStock(client, req, gasItemId, delta, reason, sourceType,
             END,
             updated_at = NOW()
         WHERE id = $2
-        RETURNING id, name, operation, stock, full_stock, empty_stock
+        RETURNING id, name, operation, brand, stock, full_stock, empty_stock
     `, [normalizedDelta, String(gasItemId), normalizedStockKind]);
 
     await recordInventoryMovement(client, req, {
@@ -1232,6 +1245,7 @@ function mapGasItem(row) {
         id: row.id,
         name: row.name,
         operation: row.operation,
+        brand: row.brand || '',
         price: Number(row.price),
         stock: fullStock,
         fullStock,
@@ -1893,7 +1907,7 @@ async function getLotteryCartResponse(sessionId, client = pool) {
 
 async function getGasState(sessionId, client = pool) {
     const itemsResult = await client.query(`
-        SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url
+        SELECT id, name, operation, brand, price, stock, full_stock, empty_stock, image_url
         FROM gas_items
         WHERE active = TRUE
         ORDER BY price DESC, id ASC
@@ -3380,7 +3394,7 @@ app.get('/api/gas/items', async (req, res) => {
     try {
         const includeInactive = req.user?.role === OWNER_ROLE && String(req.query.includeInactive || '') === 'true';
         const result = await pool.query(`
-            SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active
+            SELECT id, name, operation, brand, price, stock, full_stock, empty_stock, image_url, active
             FROM gas_items
             WHERE ($1::boolean = TRUE OR active = TRUE)
             ORDER BY price DESC, id ASC
@@ -3395,6 +3409,10 @@ app.get('/api/gas/items', async (req, res) => {
 app.post('/api/gas/items', requireOwner, async (req, res) => {
     const id = String(req.body.id || '').trim().toUpperCase();
     const name = String(req.body.name || '').trim();
+    const brand = String(req.body.brand || '').trim();
+    if (!['สยาม', 'ปตท'].includes(brand)) {
+        return res.status(400).json({ error: 'กรุณาเลือกยี่ห้อสยามหรือ ปตท.' });
+    }
     const operation = String(req.body.operation || '').trim();
     const price = Number(req.body.price);
     const fullStock = Math.max(0, Math.floor(Number(req.body.fullStock ?? req.body.full_stock ?? req.body.stock ?? 0)));
@@ -3409,7 +3427,7 @@ app.post('/api/gas/items', requireOwner, async (req, res) => {
     try {
         await client.query('BEGIN');
         const before = await client.query(`
-            SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active
+            SELECT id, name, operation, brand, price, stock, full_stock, empty_stock, image_url, active
             FROM gas_items
             WHERE id = $1
             FOR UPDATE
@@ -3419,11 +3437,12 @@ app.post('/api/gas/items', requireOwner, async (req, res) => {
         const fullStockDelta = fullStock - previousFullStock;
         const emptyStockDelta = emptyStock - previousEmptyStock;
         const result = await client.query(`
-            INSERT INTO gas_items (id, name, operation, price, stock, full_stock, empty_stock, image_url, active)
-            VALUES ($1, $2, $3, $4, $5, $5, $6, $7, TRUE)
+            INSERT INTO gas_items (id, name, operation, price, stock, full_stock, empty_stock, image_url, active, brand)
+            VALUES ($1, $2, $3, $4, $5, $5, $6, $7, TRUE, $8)
             ON CONFLICT (id)
             DO UPDATE SET
                 name = EXCLUDED.name,
+                brand = EXCLUDED.brand,
                 operation = EXCLUDED.operation,
                 price = EXCLUDED.price,
                 stock = EXCLUDED.stock,
@@ -3432,8 +3451,8 @@ app.post('/api/gas/items', requireOwner, async (req, res) => {
                 image_url = EXCLUDED.image_url,
                 active = TRUE,
                 updated_at = NOW()
-            RETURNING id, name, operation, price, stock, full_stock, empty_stock, image_url, active
-        `, [id, name, operation, price, fullStock, emptyStock, imageUrl || null]);
+            RETURNING id, name, operation, brand, price, stock, full_stock, empty_stock, image_url, active
+        `, [id, name, operation, price, fullStock, emptyStock, imageUrl || null, brand]);
         if (fullStockDelta !== 0) {
             await recordInventoryMovement(client, req, {
                 itemType: 'GAS',
@@ -3472,10 +3491,13 @@ app.post('/api/gas/items', requireOwner, async (req, res) => {
 
 app.patch('/api/gas/items/:itemId', requireOwner, async (req, res) => {
     const itemId = String(req.params.itemId || '').trim();
+    if (req.body.brand !== undefined && !['สยาม', 'ปตท'].includes(req.body.brand)) {
+        return res.status(400).json({ error: 'กรุณาเลือกยี่ห้อสยามหรือ ปตท.' });
+    }
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const before = await client.query('SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
+        const before = await client.query('SELECT id, name, operation, brand, price, stock, full_stock, empty_stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
         if (!before.rows[0]) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'gas item not found' });
@@ -3483,7 +3505,7 @@ app.patch('/api/gas/items/:itemId', requireOwner, async (req, res) => {
 
         const updates = [];
         const values = [itemId];
-        ['name', 'operation'].forEach((field) => {
+        ['name', 'operation', 'brand'].forEach((field) => {
             if (req.body[field] !== undefined) {
                 values.push(String(req.body[field] || '').trim());
                 updates.push(`${field} = $${values.length}`);
@@ -3511,7 +3533,7 @@ app.patch('/api/gas/items/:itemId', requireOwner, async (req, res) => {
             UPDATE gas_items
             SET ${updates.join(', ')}, updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, operation, price, stock, full_stock, empty_stock, image_url, active
+            RETURNING id, name, operation, brand, price, stock, full_stock, empty_stock, image_url, active
         `, values);
         await logAudit(client, req, 'UPDATE', 'GAS_ITEM', itemId, req.body.reason || 'update gas item', mapGasItem(before.rows[0]), mapGasItem(result.rows[0]));
         await client.query('COMMIT');
@@ -3530,7 +3552,7 @@ app.delete('/api/gas/items/:itemId', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const before = await client.query('SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
+        const before = await client.query('SELECT id, name, operation, brand, price, stock, full_stock, empty_stock, image_url, active FROM gas_items WHERE id = $1 FOR UPDATE', [itemId]);
         if (!before.rows[0]) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'gas item not found' });
@@ -3540,7 +3562,7 @@ app.delete('/api/gas/items/:itemId', requireOwner, async (req, res) => {
             UPDATE gas_items
             SET active = FALSE, updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, operation, price, stock, full_stock, empty_stock, image_url, active
+            RETURNING id, name, operation, brand, price, stock, full_stock, empty_stock, image_url, active
         `, [itemId]);
         await logAudit(client, req, 'DELETE', 'GAS_ITEM', itemId, req.body.reason || 'deactivate gas item', mapGasItem(before.rows[0]), mapGasItem(result.rows[0]));
         await client.query('COMMIT');
@@ -3569,7 +3591,7 @@ app.patch('/api/gas/items/:itemId/stock', requireOwner, async (req, res) => {
         await client.query('BEGIN');
         await adjustGasStock(client, req, itemId, Math.floor(delta), reason, 'STOCK_ADJUST', itemId, null, stockKind);
         const result = await client.query(`
-            SELECT id, name, operation, price, stock, full_stock, empty_stock, image_url, active
+            SELECT id, name, operation, brand, price, stock, full_stock, empty_stock, image_url, active
             FROM gas_items
             WHERE id = $1
         `, [itemId]);
@@ -3596,6 +3618,10 @@ app.get('/api/app-sessions/:sessionId/gas', async (req, res) => {
 });
 
 app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
+    const brand = String(req.body.brand || '').trim();
+    if (!['สยาม', 'ปตท'].includes(brand)) {
+        return res.status(400).json({ error: 'กรุณาเลือกยี่ห้อแก๊ส' });
+    }
     const orderItems = Array.isArray(req.body.items) ? req.body.items : [];
     const customerName = String(req.body.customerName || '').trim();
     const phone = String(req.body.phone || '').trim();
@@ -3633,7 +3659,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
             }
 
             const itemResult = await client.query(`
-                SELECT id, name, operation, price, stock, full_stock, empty_stock
+                SELECT id, name, operation, brand, price, stock, full_stock, empty_stock
                 FROM gas_items
                 WHERE id = $1 AND active = TRUE
                 FOR UPDATE
@@ -3642,6 +3668,11 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
             if (!item) {
                 await client.query('ROLLBACK');
                 return res.status(404).json({ error: "gas item not found", gasItemId });
+            }
+
+            if (item.brand !== brand) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'ยี่ห้อถังไม่ตรงกับยี่ห้อที่เลือก', gasItemId });
             }
 
             const availableFullStock = Number(item.full_stock ?? item.stock ?? 0);
@@ -3653,7 +3684,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
             await adjustGasStock(client, req, gasItemId, -quantity, `Gas job ${jobId}`, 'GAS_JOB', jobId, null, 'FULL');
             normalizedItems.push({
                 id: item.id,
-                name: ['สยาม', 'ปตท'].includes(req.body.brand) ? req.body.brand + ' ' + item.name : item.name,
+                name: item.name.includes(brand) ? item.name : `${brand} ${item.name}`,
                 operation: item.operation,
                 quantity,
                 price: Number(item.price),
