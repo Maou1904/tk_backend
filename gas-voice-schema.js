@@ -28,6 +28,8 @@ keep the entire place phrase in address, even when it contains a person's name.
 ที่ร้านป้าตุ้ม means address ร้านป้าตุ้ม, customerName null. Do not drop the destination
 or move a place into customerName. A place alone has customerName null; the shop copies
 address to the name field. Missing name AND place = both null. Phone = digits, only if stated.
+Keep vehicle registration (ทะเบียน/ทะเบียนรถ/ป้ายทะเบียน) with its number in address,
+such as ดอนปู่ตาทะเบียน 123. It is a delivery detail, never a phone or cylinder count.
 No prices, stock, payment, driver or returned-empty counts. Ignore those status instructions.
 If two brands, conflicting counts, corrections/negations or unclear sizes occur, ask a short
 Thai clarification in needsClarification. Otherwise needsClarification is empty.
@@ -87,6 +89,11 @@ function validateExtraction(raw, text) {
     for (const message of raw.needsClarification) {
         if (typeof message !== 'string' || !message.trim() || message.length > 250) throw fault(502, 'VOICE_AI_INVALID', 'AI แยกรายการไม่สำเร็จ กรุณาลองใหม่');
         draft.errors.push(message.trim());
+    }
+    // A model may shorten the destination; retain an explicitly spoken plate verbatim.
+    const plate = text.match(/(?:ป้าย)?ทะเบียน(?:รถ)?\s*[:：]?\s*(?:[0-9๐-๙]*[ก-ฮA-Za-z]+[ -]*[0-9๐-๙]+|[0-9๐-๙]+(?:-[0-9๐-๙]+)?)/u)?.[0];
+    if (draft.address && plate && !normalized(draft.address).includes(normalized(plate))) {
+        draft.address = `${draft.address} ${plate}`;
     }
     if (!draft.customerName && draft.address) draft.customerName = draft.address;
     if (!draft.brand && !draft.items.length && !draft.customerName && !draft.address && !draft.phone && !draft.errors.length) {

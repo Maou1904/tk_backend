@@ -53,6 +53,12 @@ function start(config) {
     assert.equal(unnamed.status, 200); assert.equal(unnamed.body.draft.customerName, undefined);
     assert.equal(unnamed.body.draft.address, undefined);
     console.log('PASS: place-only fills both fields, multiple sizes retain their counts, missing identity stays blank');
+    const plateOrder = await parse('ปตทถังใหญ่ 1 ถังที่ดอนปู่ตาทะเบียน 123');
+    assert.equal(plateOrder.status, 200);
+    assert.match(plateOrder.body.draft.address, /^ดอนปู่ตา\s*ทะเบียน 123$/u);
+    assert.deepEqual(plateOrder.body.draft.items, [{ sizeKg: 15, quantity: 1 }]);
+    assert.equal(plateOrder.body.draft.phone, undefined);
+    console.log('PASS: registration remains in the real model delivery destination');
     // Unexpected loss of the process must expire readiness, without a shutdown message.
     const killed = once(child, 'exit'); child.kill(); await killed; await waitReady(false);
     assert.equal((await parse('ปตท ถังใหญ่ 1 ถัง')).status, 503);

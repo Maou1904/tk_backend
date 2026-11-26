@@ -133,6 +133,21 @@ test('location-only inputs label both fields, unspecified identity and counts st
     assert.equal(missing.address, undefined);
 });
 
+test('spoken registration is retained even when the model shortens the destination', () => {
+    for (const plate of ['ทะเบียน 123', 'ทะเบียนรถ กข 1234', 'ป้ายทะเบียน ๑กข ๑๒๓๔']) {
+        const source = `ปตทถังใหญ่ 1 ถังที่ดอนปู่ตา${plate} เบอร์ 0812345678`;
+        const draft = validateExtraction({ ...raw, items: [{ sizeKg: 15, quantity: 1 }], customerName: null, address: 'ดอนปู่ตา', phone: '0812345678' }, source);
+        assert.equal(draft.address, `ดอนปู่ตา ${plate}`);
+        assert.equal(draft.customerName, draft.address);
+        assert.equal(draft.phone, '0812345678');
+        const complete = validateExtraction({ ...raw, customerName: 'คุณเจเจ', address: `ดอนปู่ตา ${plate}` }, `ให้คุณเจเจที่ดอนปู่ตา ${plate}`);
+        assert.equal(complete.address, `ดอนปู่ตา ${plate}`);
+        assert.equal(complete.customerName, 'คุณเจเจ');
+    }
+    const missing = validateExtraction({ ...raw, customerName: null, address: null }, 'ปตท ถังใหญ่ ทะเบียน 123');
+    assert.equal(missing.address, undefined);
+});
+
 test('invented places, invalid counts, duplicate sizes and extra action fields are rejected', () => {
     for (const changed of [
         { address: 'กรุงเทพมหานคร' }, { customerName: 'คุณสมชาย' },
