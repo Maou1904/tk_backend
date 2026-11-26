@@ -5,6 +5,7 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 const { initializeStoreOperations, registerStoreOperations, transferClosingTotals, transferRecordsByDateRange } = require('./store-operations');
 const { registerGasVoiceAI } = require('./gas-voice-ai');
+const { registerLotteryStockReset } = require('./lottery-stock-reset');
 
 const app = express();
 app.use(cors());
@@ -656,6 +657,8 @@ async function initializeCartTables() {
 
     await pool.query(`
         ALTER TABLE lottery_tickets ADD COLUMN IF NOT EXISTS stock_reference INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE lottery_tickets ADD COLUMN IF NOT EXISTS stock_generation INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE inventory_movements ADD COLUMN IF NOT EXISTS lottery_generation INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS submitted_by INTEGER REFERENCES app_users(id);
         ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS submitted_by_name TEXT;
         ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS reported_cash_received NUMERIC(12,2);
@@ -663,10 +666,11 @@ async function initializeCartTables() {
         ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS confirmed_by_name TEXT;
         ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ;
         WITH movements AS (
-            SELECT item_id, delta,
-                SUM(delta) OVER (PARTITION BY item_id ORDER BY id ROWS UNBOUNDED PRECEDING) AS balance_delta,
-                SUM(delta) OVER (PARTITION BY item_id) AS net_delta
-            FROM inventory_movements WHERE item_type = 'LOTTERY'
+            SELECT m.item_id, m.delta,
+                SUM(m.delta) OVER (PARTITION BY m.item_id ORDER BY m.id ROWS UNBOUNDED PRECEDING) AS balance_delta,
+                SUM(m.delta) OVER (PARTITION BY m.item_id) AS net_delta
+            FROM inventory_movements m JOIN lottery_tickets t ON m.item_id = t.id::text
+            WHERE m.item_type = 'LOTTERY' AND m.lottery_generation = t.stock_generation
         ), peaks AS (
             SELECT item_id, GREATEST(0, MAX(balance_delta)) - MAX(net_delta) AS peak_offset
             FROM movements GROUP BY item_id
@@ -943,9 +947,10 @@ async function recordInventoryMovement(client, req, movement) {
             source_id,
             reversed_from,
             stock_kind,
-            created_by
+            created_by,
+            lottery_generation
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
     `, [
         movement.itemType,
         String(movement.itemId),
@@ -957,6 +962,7 @@ async function recordInventoryMovement(client, req, movement) {
         movement.reversedFrom || null,
         movement.stockKind || 'GENERAL',
         actor.id,
+        movement.lotteryGeneration ?? 0,
     ]);
 }
 
@@ -1056,7 +1062,7 @@ async function adjustLotteryStock(client, req, ticketId, delta, reason, sourceTy
             remaining = GREATEST(0, COALESCE(remaining, 0) + $1),
             updated_at = NOW()
         WHERE id = $2
-        RETURNING id, number, series, remaining
+        RETURNING id, number, series, remaining, stock_generation
     `, [Math.trunc(Number(delta)), Number(ticketId)]);
 
     if (!result.rows[0]) {
@@ -1069,6 +1075,7 @@ async function adjustLotteryStock(client, req, ticketId, delta, reason, sourceTy
         itemType: 'LOTTERY',
         itemId: ticketId,
         itemName: `${result.rows[0].number} ${result.rows[0].series}`,
+        lotteryGeneration: result.rows[0].stock_generation,
         delta,
         reason,
         sourceType,
@@ -1100,6 +1107,13 @@ async function reverseInventoryMovements(client, req, sourceType, sourceId, reas
         } else if (movement.item_type === 'GAS') {
             await adjustGasStock(client, req, movement.item_id, reverseDelta, reason, `${sourceType}_REVERSAL`, sourceId, movement.id, normalizeGasStockKind(movement.stock_kind));
         } else if (movement.item_type === 'LOTTERY') {
+            const { rows: [ticket] } = await client.query('SELECT stock_generation FROM lottery_tickets WHERE id = $1 FOR UPDATE', [Number(movement.item_id)]);
+            if (ticket && ticket.stock_generation !== movement.lottery_generation) {
+                await recordInventoryMovement(client, req, { itemType: 'LOTTERY', itemId: movement.item_id, itemName: movement.item_name,
+                    delta: 0, reason: `${reason} (งวดเก่า ไม่คืนเข้าสต็อกงวดใหม่)`, sourceType: `${sourceType}_REVERSAL`,
+                    sourceId, reversedFrom: movement.id, lotteryGeneration: movement.lottery_generation });
+                continue;
+            }
             await adjustLotteryStock(client, req, Number(movement.item_id), reverseDelta, reason, `${sourceType}_REVERSAL`, sourceId, movement.id);
         }
     }
@@ -1246,6 +1260,7 @@ async function ensureCartSession(sessionId, client = pool) {
 function mapSaleRecord(row) {
     return {
         id: row.id,
+        sessionId: row.session_id,
         channel: row.channel,
         createdAt: row.created_at,
         customerName: row.customer_name,
@@ -2064,6 +2079,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.use('/api', requireAuth);
 registerGasVoiceAI(app);
+registerLotteryStockReset(app, { pool, requireOwner, adjustLotteryStock, logAudit });
 registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession, adjustProductStock, logAudit });
 
 app.get('/api/auth/me', (req, res) => {
@@ -2622,7 +2638,7 @@ app.post('/api/app-sessions/:sessionId/close', requireOwner, async (req, res) =>
     }
 });
 
-app.get('/api/analytics/sales', async (req, res) => {
+app.get('/api/analytics/sales', requireOwner, async (req, res) => {
     try {
         const range = resolveAnalyticsRange(req.query);
         const [sales, transfers] = await Promise.all([
@@ -2756,6 +2772,7 @@ app.post('/api/app-sessions/:sessionId/sales/:saleId/cancel', requireOwner, asyn
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(7719002)');
         const session = await ensureAppSession(req.params.sessionId, client);
         const saleResult = await client.query('SELECT * FROM sales_records WHERE id = $1 AND session_id = $2 FOR UPDATE', [
             req.params.saleId,
@@ -2800,12 +2817,14 @@ app.post('/api/app-sessions/:sessionId/sales/:saleId/cancel', requireOwner, asyn
                 if (sale.channel === 'LOTTERY') {
                     const ticketId = Number(item.ticketId || item.id || 0);
                     if (Number.isInteger(ticketId) && ticketId > 0) {
+                        const { rows: [ticket] } = await client.query('SELECT stock_generation FROM lottery_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
+                        if (!ticket || ticket.stock_generation !== Number(item.stockGeneration ?? 0)) continue;
                         await adjustLotteryStock(client, req, ticketId, quantity, reason, 'LOTTERY_SALE_REVERSAL', req.params.saleId);
                     } else if (item.number || item.barcode) {
-                        const ticketResult = await client.query('SELECT id FROM lottery_tickets WHERE number = $1 LIMIT 1', [
+                        const ticketResult = await client.query('SELECT id, stock_generation FROM lottery_tickets WHERE number = $1 LIMIT 1', [
                             item.number || item.barcode,
                         ]);
-                        if (ticketResult.rows[0]) {
+                        if (ticketResult.rows[0] && ticketResult.rows[0].stock_generation === Number(item.stockGeneration ?? 0)) {
                             await adjustLotteryStock(client, req, ticketResult.rows[0].id, quantity, reason, 'LOTTERY_SALE_REVERSAL', req.params.saleId);
                         }
                     }
@@ -4092,6 +4111,16 @@ app.post('/api/app-sessions/:sessionId/gas/jobs/:jobId/cancel', requireOwner, as
     }
 });
 
+// Pending approvals stay visible across business dates and manual draw resets.
+app.get('/api/lottery/pending', async (req, res) => {
+    try {
+        const result = await pool.query(`SELECT * FROM sales_records
+            WHERE channel = 'LOTTERY' AND status = $1 AND ($2::boolean OR submitted_by = $3)
+            ORDER BY created_at ASC`, [LOTTERY_PENDING, req.user.role === OWNER_ROLE, req.user.id]);
+        res.json(result.rows.map(mapSaleRecord));
+    } catch { res.status(500).json({ error: 'โหลดรายการสลากรอยืนยันไม่สำเร็จ' }); }
+});
+
 app.get('/api/lottery/tickets', async (req, res) => {
     try {
         const includeInactive = req.user?.role === OWNER_ROLE && String(req.query.includeInactive || '') === 'true';
@@ -4116,6 +4145,7 @@ app.post('/api/lottery/books', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(7719002)');
         for (let suffix = 0; suffix < 100; suffix++) {
             const number = String(suffix).padStart(2, '0');
             const ticket = await client.query(`
@@ -4148,6 +4178,7 @@ app.post('/api/lottery/tickets', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(7719002)');
         const ticketResult = await client.query(`
             INSERT INTO lottery_tickets (number, series, price, remaining, active)
             VALUES ($1, $2, $3, 0, TRUE)
@@ -4174,6 +4205,7 @@ app.patch('/api/lottery/tickets/:ticketId', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(7719002)');
         const before = await client.query('SELECT id, number, series, price, remaining, stock_reference, active FROM lottery_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
         if (!before.rows[0]) {
             await client.query('ROLLBACK');
@@ -4239,6 +4271,7 @@ app.delete('/api/lottery/tickets/:ticketId', requireOwner, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(7719002)');
         const before = await client.query('SELECT id, number, series, price, remaining, stock_reference, active FROM lottery_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
         if (!before.rows[0]) {
             await client.query('ROLLBACK');
@@ -4282,6 +4315,7 @@ app.post('/api/lottery-sessions/:sessionId/cart/items', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(7719002)');
         const session = await ensureOpenAppSession(req.params.sessionId, client);
         const sessionId = await ensureLotteryCartSession(session.session_id, client);
         const ticketResult = await client.query(`
@@ -4331,6 +4365,7 @@ app.patch('/api/lottery-sessions/:sessionId/cart/items/:ticketId', async (req, r
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(7719002)');
         const session = await ensureOpenAppSession(req.params.sessionId, client);
         const sessionId = await ensureLotteryCartSession(session.session_id, client);
         if (!Number.isInteger(ticketId)) {
@@ -4397,6 +4432,7 @@ app.post('/api/app-sessions/:sessionId/lottery/:saleId/confirm', requireOwner, a
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(7719002)');
         const session = await ensureOpenAppSession(req.params.sessionId, client);
         const { rows: [sale] } = await client.query(
             "SELECT * FROM sales_records WHERE id = $1 AND session_id = $2 AND channel = 'LOTTERY' FOR UPDATE",
@@ -4424,6 +4460,7 @@ app.post('/api/app-sessions/:sessionId/lottery/checkout', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(7719002)');
         const session = await ensureOpenAppSession(req.params.sessionId, client);
         const sessionId = await ensureLotteryCartSession(session.session_id, client);
         const cart = await getLotteryCartItems(sessionId, client);
@@ -4443,8 +4480,10 @@ app.post('/api/app-sessions/:sessionId/lottery/checkout', async (req, res) => {
 
         const createdAt = new Date();
         const saleId = `${createSaleId('LOTTERY', createdAt)}-${crypto.randomBytes(6).toString('hex')}`;
+        const generations = new Map();
         for (const item of cart) {
-            const ticketResult = await client.query('SELECT remaining FROM lottery_tickets WHERE id = $1 FOR UPDATE', [Number(item.id)]);
+            const ticketResult = await client.query('SELECT remaining, stock_generation FROM lottery_tickets WHERE id = $1 AND active = TRUE FOR UPDATE', [Number(item.id)]);
+            generations.set(item.id, ticketResult.rows[0]?.stock_generation ?? 0);
             const remaining = Number(ticketResult.rows[0]?.remaining || 0);
             if (remaining < item.quantity) {
                 await client.query('ROLLBACK');
@@ -4464,6 +4503,7 @@ app.post('/api/app-sessions/:sessionId/lottery/checkout', async (req, res) => {
             items: cart.map((item) => ({
                 id: item.id,
                 ticketId: item.id,
+                stockGeneration: generations.get(item.id),
                 number: item.number,
                 name: item.name,
                 barcode: item.number,

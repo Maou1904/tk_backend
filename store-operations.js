@@ -230,7 +230,7 @@ function registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession
         res.json(settings);
     }));
 
-    app.get(transferPath, route(async (req, res) => {
+    app.get(transferPath, requireOwner, route(async (req, res) => {
         const [totals, records, settings] = await Promise.all([
             transferClosingTotals(pool, req.params.sessionId),
             pool.query(`${transferListSql} WHERE session_id = $1 ORDER BY created_at DESC, id DESC LIMIT 100`, [req.params.sessionId]),
@@ -251,7 +251,7 @@ function registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession
         res.json({ defaultFee });
     }));
 
-    app.post(transferPath, route(async (req, res) => {
+    app.post(transferPath, requireOwner, route(async (req, res) => {
         const id = identifier(req.body.id);
         const principal = satang(req.body.principal, 1);
         const fee = satang(req.body.fee);
