@@ -42,6 +42,17 @@ function start(config) {
     assert.equal(result.status, 200); assert.equal(result.body.source, 'local');
     assert.equal(result.body.draft.customerName, 'คุณเจเจ'); assert.equal(result.body.draft.address, 'ดอนภูตา');
     console.log(JSON.stringify({ scenario: 'real_worker_round_trip', durationMs: result.durationMs, passed: true }));
+    const place = await parse('ส่งสยามถังใหญ่ 1 ถัง ที่ร้านป้าตุ้ม');
+    assert.equal(place.status, 200); assert.equal(place.body.draft.address, 'ร้านป้าตุ้ม');
+    assert.equal(place.body.draft.customerName, 'ร้านป้าตุ้ม');
+    const multiple = await parse('ส่งสยามถังใหญ่ 1 ถัง ถังเล็ก 2 ถัง ให้คุณเจเจที่ดอนภูตา');
+    assert.equal(multiple.status, 200);
+    assert.deepEqual(multiple.body.draft.items, [{ sizeKg: 15, quantity: 1 }, { sizeKg: 4, quantity: 2 }]);
+    assert.equal(multiple.body.draft.customerName, 'คุณเจเจ'); assert.equal(multiple.body.draft.address, 'ดอนภูตา');
+    const unnamed = await parse('ส่งปตทถังใหญ่ 1 ถัง');
+    assert.equal(unnamed.status, 200); assert.equal(unnamed.body.draft.customerName, undefined);
+    assert.equal(unnamed.body.draft.address, undefined);
+    console.log('PASS: place-only fills both fields, multiple sizes retain their counts, missing identity stays blank');
     // Unexpected loss of the process must expire readiness, without a shutdown message.
     const killed = once(child, 'exit'); child.kill(); await killed; await waitReady(false);
     assert.equal((await parse('ปตท ถังใหญ่ 1 ถัง')).status, 503);
@@ -52,7 +63,7 @@ function start(config) {
     const stopped = once(child, 'exit'); fs.writeFileSync(path.join(runtime, 'stop'), 'stop'); await stopped;
     await waitReady(false);
     const logs = fs.readFileSync(path.join(runtime, 'worker.log'), 'utf8');
-    assert(!logs.includes('คุณเจเจ') && !logs.includes('หลังวัด') && !logs.includes('PRIVATE KEY'));
+    assert(!logs.includes('คุณเจเจ') && !logs.includes('หลังวัด') && !logs.includes('ป้าตุ้ม') && !logs.includes('PRIVATE KEY'));
     console.log('PASS: real local worker reconnects after process loss, graceful stop switches to rules, and local logs contain no order content');
 })().catch(error => { console.error(error.message); process.exitCode = 1; }).finally(async () => {
     if (child && child.exitCode === null) { const exited = once(child, 'exit'); child.kill(); await exited; }

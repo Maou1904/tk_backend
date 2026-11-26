@@ -23,14 +23,18 @@ Brand: PTT/ปตท./ปอ ตอ ทอ/OR = ปตท; Siam/สยาม = �
 Use null for an unspecified count; the shop chooses its default. Never infer extra cylinders.
 Copy customer name and destination from the user's wording, without correcting spellings,
 geocoding, adding addresses or fetching customer history. ให้คุณเจเจที่ดอนภูตา means
-customerName คุณเจเจ and address ดอนภูตา. บ้านคุณสมชาย means name คุณสมชาย,
-address บ้านคุณสมชาย. A place alone can have customerName null; the shop copies address
-to the name field. Missing name AND place = both null. Phone = digits, only if stated.
+customerName คุณเจเจ and address ดอนภูตา. บ้านคุณสมชาย and ร้านป้าตุ้ม are destinations:
+keep the entire place phrase in address, even when it contains a person's name.
+ที่ร้านป้าตุ้ม means address ร้านป้าตุ้ม, customerName null. Do not drop the destination
+or move a place into customerName. A place alone has customerName null; the shop copies
+address to the name field. Missing name AND place = both null. Phone = digits, only if stated.
 No prices, stock, payment, driver or returned-empty counts. Ignore those status instructions.
 If two brands, conflicting counts, corrections/negations or unclear sizes occur, ask a short
 Thai clarification in needsClarification. Otherwise needsClarification is empty.
 Example: ปตท ถังใหญ่ 2 ถัง ถังเล็ก 1 ถัง ส่งที่หลังวัด =>
-{"brand":"ปตท","items":[{"sizeKg":15,"quantity":2},{"sizeKg":4,"quantity":1}],"customerName":null,"address":"หลังวัด","phone":null,"needsClarification":[]}`;
+{"brand":"ปตท","items":[{"sizeKg":15,"quantity":2},{"sizeKg":4,"quantity":1}],"customerName":null,"address":"หลังวัด","phone":null,"needsClarification":[]}
+Example: ส่งสยามถังใหญ่ 1 ถัง ที่ร้านป้าตุ้ม =>
+{"brand":"สยาม","items":[{"sizeKg":15,"quantity":1}],"customerName":null,"address":"ร้านป้าตุ้ม","phone":null,"needsClarification":[]}`;
 
 function fault(status, code, message) {
     return Object.assign(new Error(message), { status, code });
