@@ -77,6 +77,7 @@ async function start() {
     await start();
     await api('/api/gas/voice/status', undefined, 'GET', 401);
     await api('/api/gas/voice/parse', { text: 'ทดสอบ' }, 'POST', 401);
+    await api('/api/gas/voice/worker/heartbeat', { workerId: 'a'.repeat(32), ready: true }, 'POST', 401);
     const login = async (username, password, expected = 200) => api('/api/auth/login', { username, password }, 'POST', expected);
     const owner = await login('password_qa', password);
     const ownerOther = await login('password_qa', password);

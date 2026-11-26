@@ -4,7 +4,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const { initializeStoreOperations, registerStoreOperations, transferClosingTotals, transferRecordsByDateRange } = require('./store-operations');
-const { registerGasVoiceAI } = require('./gas-voice-ai');
+const { createGasVoiceAI, registerGasVoiceAI, registerGasVoiceWorker } = require('./gas-voice-ai');
 const { registerLotteryStockReset } = require('./lottery-stock-reset');
 
 const app = express();
@@ -2077,8 +2077,10 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+const gasVoiceAI = createGasVoiceAI();
+registerGasVoiceWorker(app, gasVoiceAI);
 app.use('/api', requireAuth);
-registerGasVoiceAI(app);
+registerGasVoiceAI(app, gasVoiceAI);
 registerLotteryStockReset(app, { pool, requireOwner, adjustLotteryStock, logAudit });
 registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession, adjustProductStock, logAudit });
 
