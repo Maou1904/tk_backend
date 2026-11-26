@@ -477,6 +477,12 @@ async function initializeCartTables() {
 
     await pool.query(`
         ALTER TABLE gas_jobs
+        ADD COLUMN IF NOT EXISTS distant_delivery BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS distant_delivery_fee NUMERIC(12, 2) NOT NULL DEFAULT 0
+    `);
+
+    await pool.query(`
+        ALTER TABLE gas_jobs
         ADD COLUMN IF NOT EXISTS returned_tank_quantity INTEGER NOT NULL DEFAULT 0
     `);
 
@@ -1969,6 +1975,8 @@ async function getGasState(sessionId, client = pool) {
             driver,
             total,
             delivery_fee,
+            distant_delivery,
+            distant_delivery_fee,
             returned_tank_quantity,
             empty_tank_returned,
             paid,
@@ -2019,6 +2027,8 @@ async function getGasState(sessionId, client = pool) {
             items: jobItemsByJobId.get(job.id) || [],
             total: Number(job.total),
             deliveryFee: Number(job.delivery_fee),
+            distantDelivery: Boolean(job.distant_delivery),
+            distantDeliveryFee: Number(job.distant_delivery_fee),
             returnedTankQuantity: Number(job.returned_tank_quantity || 0),
             emptyTankReturned: Boolean(job.empty_tank_returned),
             paid: Boolean(job.paid),
@@ -3706,7 +3716,14 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
     const phone = String(req.body.phone || '').trim();
     const address = String(req.body.address || '').trim();
     const driver = String(req.body.driver || '').trim() || 'ยังไม่ระบุ';
-    const deliveryFee = Math.max(0, Number(req.body.deliveryFee || 0));
+    const baseDeliveryFee = Number(req.body.deliveryFee ?? 0);
+    if (!Number.isFinite(baseDeliveryFee) || baseDeliveryFee < 0 || baseDeliveryFee >= 1e10) {
+        return res.status(400).json({ error: 'ค่าส่งต้องเป็นจำนวนเงินตั้งแต่ 0 บาท' });
+    }
+    if (req.body.distantDelivery !== undefined && typeof req.body.distantDelivery !== 'boolean') {
+        return res.status(400).json({ error: 'กรุณาระบุสถานะส่งไกลให้ถูกต้อง' });
+    }
+    const distantDelivery = req.body.distantDelivery === true;
     const paid = req.user.role === OWNER_ROLE ? req.body.paid !== false : false;
     const requestedReturnedTankQuantity = req.user.role === OWNER_ROLE
         ? Math.max(0, Math.floor(Number(req.body.emptyTankReturnQuantity || 0)))
@@ -3732,9 +3749,10 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
 
         for (const orderItem of orderItems) {
             const gasItemId = String(orderItem.id || '').trim();
-            const quantity = Math.max(0, Math.floor(Number(orderItem.quantity || 0)));
-            if (!gasItemId || quantity <= 0) {
-                continue;
+            const quantity = Number(orderItem.quantity);
+            if (!gasItemId || !Number.isSafeInteger(quantity) || quantity <= 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'จำนวนถังต้องเป็นจำนวนเต็มตั้งแต่ 1 ถัง' });
             }
 
             const itemResult = await client.query(`
@@ -3779,6 +3797,8 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
 
         const returnedTankQuantity = Math.min(totalTankQuantity, requestedReturnedTankQuantity);
         const emptyTankReturned = returnedTankQuantity >= totalTankQuantity;
+        const distantDeliveryFee = distantDelivery ? totalTankQuantity * 50 : 0;
+        const deliveryFee = Math.round(baseDeliveryFee * 100) / 100 + distantDeliveryFee;
         const total = subtotal + deliveryFee;
         const jobStatus = paid && emptyTankReturned ? 'เสร็จแล้ว' : 'กำลังดำเนินการ';
 
@@ -3797,9 +3817,11 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
                 paid,
                 status,
                 created_at,
+                distant_delivery,
+                distant_delivery_fee,
                 completed_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, CASE WHEN $12::text = 'เสร็จแล้ว' THEN $13::timestamptz ELSE NULL END)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, $14, $15, CASE WHEN $12::text = 'เสร็จแล้ว' THEN $13::timestamptz ELSE NULL END)
         `, [
             jobId,
             session.session_id,
@@ -3814,6 +3836,8 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
             paid,
             jobStatus,
             createdAt,
+            distantDelivery,
+            distantDeliveryFee,
         ]);
 
         let remainingReturnedTanks = returnedTankQuantity;
@@ -3879,7 +3903,7 @@ app.post('/api/app-sessions/:sessionId/gas/jobs', async (req, res) => {
             total,
             cashReceived: paid ? total : 0,
             change: 0,
-            note: `${phone} | ${address} | ค่าส่ง ${deliveryFee} | คืนถังเปล่า ${returnedTankQuantity}/${totalTankQuantity} | ${paid ? 'จ่ายแล้ว' : 'ค้างจ่าย'}`,
+            note: `${phone} | ${address} | ค่าส่ง ${deliveryFee}${distantDelivery ? ` (ส่งไกล ${totalTankQuantity} ถัง × 50 = ${distantDeliveryFee})` : ''} | คืนถังเปล่า ${returnedTankQuantity}/${totalTankQuantity} | ${paid ? 'จ่ายแล้ว' : 'ค้างจ่าย'}`,
         };
         await insertSaleRecord(client, session.session_id, sale);
 

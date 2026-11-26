@@ -144,6 +144,48 @@ async function checkStock(siamFull = 10, siamEmpty = 0) {
     await api(`${jobs}/${pttSale.sale.id}/cancel`, { reason: 'ทดสอบคืนสต็อก ปตท.' });
     await checkStock();
     console.log('PASS: sale deducts only Siam, returned empty belongs to Siam, cancellation restores exact stock once');
+    await api('/api/gas/items', { id: 'SIAM-4', name: 'สยาม 4 กก.', operation: 'ขายแก๊ส', brand: 'สยาม', price: 200, fullStock: 5, emptyStock: 0 }, 'POST', 201);
+    for (const invalid of [
+        { distantDelivery: 'true' }, { deliveryFee: 'invalid' }, { deliveryFee: -1 },
+        { items: [{ id: 'SIAM-15', quantity: 1.5 }] },
+    ]) await api(jobs, { ...order, ...invalid }, 'POST', 400);
+    await checkStock();
+    const far = await api(jobs, { ...order, deliveryFee: 20, distantDelivery: true, distantDeliveryFee: 1,
+        emptyTankReturnQuantity: 3, items: [{ id: 'SIAM-15', quantity: 2 }, { id: 'SIAM-4', quantity: 1 }] }, 'POST', 201);
+    const farJob = far.state.jobs.find(job => job.id === far.sale.id);
+    assert.equal(farJob.distantDelivery, true);
+    assert.equal(farJob.distantDeliveryFee, 150);
+    assert.equal(farJob.deliveryFee, 170);
+    assert.equal(farJob.total, 1370);
+    assert.equal(far.sale.total, 1370);
+    assert.equal(far.sale.cashReceived, 1370);
+    assert.match(far.sale.note, /ส่งไกล 3 ถัง × 50 = 150/);
+    const persisted = (await client.query('SELECT distant_delivery, distant_delivery_fee, delivery_fee, total FROM gas_jobs WHERE id = $1', [far.sale.id])).rows[0];
+    assert.equal(persisted.distant_delivery, true);
+    assert.equal(Number(persisted.distant_delivery_fee), 150);
+    assert.equal(Number(persisted.total), 1370);
+    const summary = await api(`/api/app-sessions/${session.session_id}/closing-summary`);
+    assert.equal(summary.sections.gas.total, 1370);
+    assert.equal(summary.sections.gas.deliveryFeeTotal, 170);
+    await stop(); await start();
+    token = (await api('/api/auth/login', { username: 'brand_qa', password })).token;
+    const reloaded = (await api(`/api/app-sessions/${session.session_id}/gas`)).jobs.find(job => job.id === far.sale.id);
+    assert.equal(reloaded.distantDeliveryFee, 150);
+    assert.equal(reloaded.total, 1370);
+    await api(`${jobs}/${far.sale.id}/cancel`, { reason: 'ทดสอบยกเลิกส่งไกล' });
+    await checkStock();
+    const afterCancel = await api(`/api/app-sessions/${session.session_id}/closing-summary`);
+    assert.equal(afterCancel.sections.gas.total, 0);
+    assert.equal(afterCancel.sections.gas.deliveryFeeTotal, 0);
+    const singleFar = await api(jobs, { ...order, distantDelivery: true }, 'POST', 201);
+    assert.equal(singleFar.sale.total, 550);
+    assert.equal(singleFar.state.jobs.find(job => job.id === singleFar.sale.id).distantDeliveryFee, 50);
+    await api(`${jobs}/${singleFar.sale.id}/cancel`, { reason: 'ทดสอบส่งไกลถังเดียว' });
+    const normal = await api(jobs, { ...order, distantDelivery: false, distantDeliveryFee: 9999 }, 'POST', 201);
+    assert.equal(normal.sale.total, 500);
+    assert.equal(normal.state.jobs.find(job => job.id === normal.sale.id).distantDeliveryFee, 0);
+    await api(`${jobs}/${normal.sale.id}/cancel`, { reason: 'ทดสอบไม่เลือกส่งไกล' });
+    console.log('PASS: distant delivery uses 50 per cylinder across sizes, persists, reconciles closing totals and reverses on cancellation');
     await stop();
     await start();
     await checkStock();
