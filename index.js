@@ -42,7 +42,7 @@ const LOTTERY_PENDING = 'รอเจ้าของร้านยืนยั�
 const SESSION_OPEN = 'OPEN';
 const SESSION_CLOSED = 'CLOSED';
 const LEGACY_OPEN_STATUS = 'ACTIVE';
-const CLOSING_SECTIONS = ['POS', 'GAS', 'LOTTERY', 'TOPUP', 'TRANSFER', 'STOCK'];
+const CLOSING_SECTIONS = ['POS', 'GAS', 'LOTTERY', 'TOPUP', 'TRANSFER', 'ELECTRICITY', 'STOCK'];
 const PASSWORD_ITERATIONS = 120000;
 const SESSION_TTL_DAYS = 14;
 
@@ -1708,8 +1708,10 @@ async function getClosingSummary(sessionId, client = pool) {
     const topupTotal = topupResult.rows.reduce((sum, row) => sum + Number(row.total), 0);
     const topupCount = topupResult.rows.reduce((sum, row) => sum + Number(row.order_count), 0);
     const transfers = await transferClosingTotals(client, session.session_id);
+    const electricity = await transferClosingTotals(client, session.session_id, 'ELECTRICITY');
     const checks = (await getClosingChecks(session.session_id, client))
-        .filter((check) => check.section !== 'TRANSFER' || transfers.records > 0);
+        .filter((check) => (check.section !== 'TRANSFER' || transfers.records > 0)
+            && (check.section !== 'ELECTRICITY' || electricity.records > 0));
     const readyToClose = isOpenSessionStatus(session.status) && checks.every((check) => check.confirmed);
 
     return {
@@ -1719,6 +1721,7 @@ async function getClosingSummary(sessionId, client = pool) {
         readyToClose,
         sections: {
             transfers,
+            electricity,
             pos: {
                 billCount: Number(posTotalsResult.rows[0].bill_count),
                 itemCount: posItemsResult.rows.reduce((sum, row) => sum + Number(row.quantity), 0),

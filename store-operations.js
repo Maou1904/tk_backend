@@ -16,12 +16,16 @@ async function initializeStoreOperations(pool) {
         );
         CREATE INDEX IF NOT EXISTS cash_transfers_session_idx ON cash_transfers (session_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS cash_transfers_created_idx ON cash_transfers (created_at);
-        CREATE UNIQUE INDEX IF NOT EXISTS cash_transfers_reference_idx
-            ON cash_transfers (lower(bank), lower(reference)) WHERE reference <> '' AND cancelled_at IS NULL;
+        ALTER TABLE cash_transfers ADD COLUMN IF NOT EXISTS service_type TEXT NOT NULL DEFAULT 'TRANSFER'
+            CHECK (service_type IN ('TRANSFER', 'ELECTRICITY'));
+        CREATE UNIQUE INDEX IF NOT EXISTS cash_transfers_bank_reference_idx
+            ON cash_transfers (lower(bank), lower(reference)) WHERE service_type = 'TRANSFER' AND reference <> '' AND cancelled_at IS NULL;
+        DROP INDEX IF EXISTS cash_transfers_reference_idx;
         CREATE TABLE IF NOT EXISTS transfer_settings (
             singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
             default_fee BIGINT NOT NULL CHECK (default_fee >= 0)
         );
+        ALTER TABLE transfer_settings ADD COLUMN IF NOT EXISTS electricity_fee BIGINT NOT NULL DEFAULT 0 CHECK (electricity_fee >= 0);
         ALTER TABLE transfer_settings ADD COLUMN IF NOT EXISTS gas_delivery_fee BIGINT NOT NULL DEFAULT 2000;
         ALTER TABLE transfer_settings ADD COLUMN IF NOT EXISTS topup_amount BIGINT NOT NULL DEFAULT 10000;
         CREATE TABLE IF NOT EXISTS purchase_orders (
@@ -109,7 +113,7 @@ function clean(value, limit = 250) {
 
 function transfer(row) {
     return {
-        id: row.id, principal: Number(row.principal), fee: Number(row.fee),
+        id: row.id, serviceType: row.service_type || 'TRANSFER', principal: Number(row.principal), fee: Number(row.fee),
         cashReceived: Number(row.cash_received), change: Number(row.cash_received) - Number(row.principal) - Number(row.fee),
         bank: row.bank, reference: row.reference, note: row.note, createdAt: row.created_at,
         cancelledAt: row.cancelled_at, cancelReason: row.cancel_reason,
@@ -117,15 +121,15 @@ function transfer(row) {
     };
 }
 
-async function transferClosingTotals(client, sessionId) {
+async function transferClosingTotals(client, sessionId, serviceType = 'TRANSFER') {
     const { rows: [row] } = await client.query(`
         SELECT COUNT(*) AS records, COUNT(*) FILTER (WHERE cancelled_at IS NULL) AS count,
                SUM(principal) FILTER (WHERE cancelled_at IS NULL) AS principal,
                SUM(fee) FILTER (WHERE cancelled_at IS NULL) AS fee,
                SUM(cash_received) FILTER (WHERE cancelled_at IS NULL) AS cash,
                SUM(cash_received - principal - fee) FILTER (WHERE cancelled_at IS NULL) AS change
-        FROM cash_transfers WHERE session_id = $1
-    `, [sessionId]);
+        FROM cash_transfers WHERE session_id = $1 AND service_type = $2
+    `, [sessionId, serviceType]);
     return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, Number(value)]));
 }
 
@@ -168,7 +172,7 @@ function registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession
         try {
             await handler(req, res);
         } catch (error) {
-            if (error.constraint === 'cash_transfers_reference_idx') {
+            if (error.constraint === 'cash_transfers_bank_reference_idx') {
                 return res.status(409).json({ error: 'เลขอ้างอิงนี้มีรายการรับโอนแล้ว' });
             }
             if (!error.statusCode) console.error(error.message);
@@ -193,17 +197,11 @@ function registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession
         }
     }
 
-    const transferPath = '/api/app-sessions/:sessionId/transfers';
-    const transferListSql = `SELECT t.*, COALESCE(u.display_name, u.username) AS staff
-        FROM cash_transfers t JOIN app_users u ON u.id = t.created_by`;
-    const resetTransferCheck = (client, sessionId) => client.query(
-        "DELETE FROM app_session_closing_checks WHERE session_id = $1 AND section = 'TRANSFER'", [sessionId],
-    );
-
     const readSettings = async () => {
-        const { rows: [row] } = await pool.query('SELECT default_fee, gas_delivery_fee, topup_amount FROM transfer_settings');
+        const { rows: [row] } = await pool.query('SELECT default_fee, electricity_fee, gas_delivery_fee, topup_amount FROM transfer_settings');
         return {
             defaultFee: Number(row?.default_fee ?? 0),
+            electricityFee: Number(row?.electricity_fee ?? 0),
             gasDeliveryFee: Number(row?.gas_delivery_fee ?? 2000),
             topupAmount: Number(row?.topup_amount ?? 10000),
         };
@@ -216,27 +214,19 @@ function registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession
     app.put('/api/store-settings', requireOwner, route(async (req, res) => {
         const settings = {
             defaultFee: satang(req.body.defaultFee),
+            electricityFee: req.body.electricityFee === undefined ? (await readSettings()).electricityFee : satang(req.body.electricityFee),
             gasDeliveryFee: satang(req.body.gasDeliveryFee),
             topupAmount: satang(req.body.topupAmount, 1),
         };
         await transaction(async (client) => {
             await client.query(`
-                INSERT INTO transfer_settings (default_fee, gas_delivery_fee, topup_amount) VALUES ($1,$2,$3)
+                INSERT INTO transfer_settings (default_fee, gas_delivery_fee, topup_amount, electricity_fee) VALUES ($1,$2,$3,$4)
                 ON CONFLICT (singleton) DO UPDATE SET default_fee = EXCLUDED.default_fee,
-                    gas_delivery_fee = EXCLUDED.gas_delivery_fee, topup_amount = EXCLUDED.topup_amount
-            `, [settings.defaultFee, settings.gasDeliveryFee, settings.topupAmount]);
+                    gas_delivery_fee = EXCLUDED.gas_delivery_fee, topup_amount = EXCLUDED.topup_amount, electricity_fee = EXCLUDED.electricity_fee
+            `, [settings.defaultFee, settings.gasDeliveryFee, settings.topupAmount, settings.electricityFee]);
             await logAudit(client, req, 'UPDATE', 'STORE_SETTINGS', 'defaults', null, null, settings);
         });
         res.json(settings);
-    }));
-
-    app.get(transferPath, requireOwner, route(async (req, res) => {
-        const [totals, records, settings] = await Promise.all([
-            transferClosingTotals(pool, req.params.sessionId),
-            pool.query(`${transferListSql} WHERE session_id = $1 ORDER BY created_at DESC, id DESC LIMIT 100`, [req.params.sessionId]),
-            pool.query('SELECT default_fee FROM transfer_settings'),
-        ]);
-        res.json({ totals, records: records.rows.map(transfer), defaultFee: Number(settings.rows[0]?.default_fee ?? 0) });
     }));
 
     app.put('/api/transfer-settings', requireOwner, route(async (req, res) => {
@@ -251,62 +241,84 @@ function registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession
         res.json({ defaultFee });
     }));
 
-    app.post(transferPath, requireOwner, route(async (req, res) => {
-        const id = identifier(req.body.id);
-        const principal = satang(req.body.principal, 1);
-        const fee = satang(req.body.fee);
-        const cash = satang(req.body.cashReceived);
-        const bank = clean(req.body.bank, 60);
-        const reference = clean(req.body.reference, 100);
-        const note = clean(req.body.note);
-        if (cash < principal + fee) throw problem(400, 'เงินสดรับต่ำกว่ายอดที่ต้องเก็บ');
-        if (reference && !bank) throw problem(400, 'กรุณาระบุธนาคารพร้อมเลขอ้างอิง');
+    for (const serviceType of ['TRANSFER', 'ELECTRICITY']) {
+        const transferPath = `/api/app-sessions/:sessionId/${serviceType === 'ELECTRICITY' ? 'electricity' : 'transfers'}`;
+        const transferListSql = `SELECT t.*, COALESCE(u.display_name, u.username) AS staff
+            FROM cash_transfers t JOIN app_users u ON u.id = t.created_by`;
+        const resetTransferCheck = (client, sessionId) => client.query(
+            "DELETE FROM app_session_closing_checks WHERE session_id = $1 AND section = $2", [sessionId, serviceType],
+        );
 
-        const record = await transaction(async (client) => {
-            const session = await ensureOpenAppSession(req.params.sessionId, client);
-            const { rows: [row] } = await client.query(`
-                INSERT INTO cash_transfers (id, session_id, principal, fee, cash_received, bank, reference, note, created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                ON CONFLICT (id) DO NOTHING RETURNING *
-            `, [id, session.session_id, principal, fee, cash, bank, reference, note, req.user.id]);
-            if (!row) {
-                const { rows: [existing] } = await client.query(`${transferListSql} WHERE t.id = $1`, [id]);
-                if (existing.session_id !== session.session_id || existing.created_by !== req.user.id ||
-                    Number(existing.principal) !== principal || Number(existing.fee) !== fee ||
-                    Number(existing.cash_received) !== cash || existing.bank !== bank ||
-                    existing.reference !== reference || existing.note !== note) {
-                    throw problem(409, 'รหัสนี้ถูกใช้บันทึกรายการแล้ว');
+        app.get(transferPath, requireOwner, route(async (req, res) => {
+            const [totals, records, settings] = await Promise.all([
+                transferClosingTotals(pool, req.params.sessionId, serviceType),
+                pool.query(`${transferListSql} WHERE session_id = $1 AND service_type = $2 ORDER BY created_at DESC, id DESC LIMIT 100`, [req.params.sessionId, serviceType]),
+                pool.query('SELECT default_fee, electricity_fee FROM transfer_settings'),
+            ]);
+            res.json({ totals, records: records.rows.map(transfer), defaultFee: Number(settings.rows[0]?.[serviceType === 'ELECTRICITY' ? 'electricity_fee' : 'default_fee'] ?? 0) });
+        }));
+
+        app.post(transferPath, requireOwner, route(async (req, res) => {
+            const id = identifier(req.body.id);
+            const principal = satang(req.body.principal, 1);
+            const fee = satang(req.body.fee);
+            const cash = satang(req.body.cashReceived);
+            const bank = clean(req.body.bank, 60);
+            const reference = clean(req.body.reference, 100);
+            const note = clean(req.body.note);
+            if (cash < principal + fee) throw problem(400, 'เงินสดรับต่ำกว่ายอดที่ต้องเก็บ');
+            if (serviceType === 'TRANSFER' && reference && !bank) throw problem(400, 'กรุณาระบุธนาคารพร้อมเลขอ้างอิง');
+
+            const record = await transaction(async (client) => {
+                const session = await ensureOpenAppSession(req.params.sessionId, client);
+                const { rows: [row] } = await client.query(`
+                    INSERT INTO cash_transfers (id, session_id, principal, fee, cash_received, bank, reference, note, created_by, service_type)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                    ON CONFLICT (id) DO NOTHING RETURNING *
+                `, [id, session.session_id, principal, fee, cash, bank, reference, note, req.user.id, serviceType]);
+                if (!row) {
+                    const { rows: [existing] } = await client.query(`${transferListSql} WHERE t.id = $1`, [id]);
+                    if (existing.service_type !== serviceType || existing.session_id !== session.session_id || existing.created_by !== req.user.id ||
+                        Number(existing.principal) !== principal || Number(existing.fee) !== fee ||
+                        Number(existing.cash_received) !== cash || existing.bank !== bank ||
+                        existing.reference !== reference || existing.note !== note) {
+                        throw problem(409, 'รหัสนี้ถูกใช้บันทึกรายการแล้ว');
+                    }
+                    return transfer(existing);
                 }
-                return transfer(existing);
-            }
-            await resetTransferCheck(client, session.session_id);
-            const result = transfer(row);
-            await logAudit(client, req, 'CREATE', 'CASH_TRANSFER', id, null, null, result);
-            return result;
-        });
-        res.status(201).json(record);
-    }));
+                await resetTransferCheck(client, session.session_id);
+                const result = transfer(row);
+                await logAudit(client, req, 'CREATE', serviceType === 'ELECTRICITY' ? 'ELECTRICITY_PAYMENT' : 'CASH_TRANSFER', id, null, null, result);
+                return result;
+            });
+            res.status(201).json(record);
+        }));
 
-    app.post(`${transferPath}/:id/cancel`, requireOwner, route(async (req, res) => {
-        const id = identifier(req.params.id);
-        const reason = clean(req.body.reason);
-        if (!reason) throw problem(400, 'กรุณาระบุเหตุผลที่ยกเลิก');
-        const record = await transaction(async (client) => {
-            const session = await ensureOpenAppSession(req.params.sessionId, client);
-            const { rows: [before] } = await client.query(
-                'SELECT * FROM cash_transfers WHERE session_id = $1 AND id = $2 FOR UPDATE', [session.session_id, id],
-            );
-            if (!before) throw problem(404, 'ไม่พบรายการรับโอน');
-            if (before.cancelled_at) return transfer(before);
-            const { rows: [row] } = await client.query(
-                'UPDATE cash_transfers SET cancelled_at = NOW(), cancel_reason = $2 WHERE id = $1 RETURNING *', [id, reason],
-            );
-            await resetTransferCheck(client, session.session_id);
-            await logAudit(client, req, 'CANCEL', 'CASH_TRANSFER', id, reason, transfer(before), transfer(row));
-            return transfer(row);
-        });
-        res.json(record);
-    }));
+        app.post(`${transferPath}/:id/cancel`, requireOwner, route(async (req, res) => {
+            const id = identifier(req.params.id);
+            const reason = clean(req.body.reason);
+            if (!reason) throw problem(400, 'กรุณาระบุเหตุผลที่ยกเลิก');
+            const record = await transaction(async (client) => {
+                const session = await ensureOpenAppSession(req.params.sessionId, client);
+                const { rows: [before] } = await client.query(
+                    'SELECT * FROM cash_transfers WHERE session_id = $1 AND id = $2 AND service_type = $3 FOR UPDATE', [session.session_id, id, serviceType],
+                );
+                if (!before) throw problem(404, serviceType === 'ELECTRICITY' ? 'ไม่พบรายการจ่ายค่าไฟ' : 'ไม่พบรายการรับโอน');
+                if (before.cancelled_at) return transfer(before);
+                const { rows: [row] } = await client.query(
+                    'UPDATE cash_transfers SET cancelled_at = NOW(), cancel_reason = $2 WHERE id = $1 RETURNING *', [id, reason],
+                );
+                await resetTransferCheck(client, session.session_id);
+                await logAudit(client, req, 'CANCEL', serviceType === 'ELECTRICITY' ? 'ELECTRICITY_PAYMENT' : 'CASH_TRANSFER', id, reason, transfer(before), transfer(row));
+                return transfer(row);
+            });
+            res.json(record);
+        }));
+
+    }
+
+    const transferListSql = `SELECT t.*, COALESCE(u.display_name, u.username) AS staff
+        FROM cash_transfers t JOIN app_users u ON u.id = t.created_by`;
 
     app.get('/api/tax-report', requireOwner, route(async (req, res) => {
         const start = monthStart(req.query.month);
