@@ -83,7 +83,8 @@ async function start() {
     const legacy = { id: crypto.randomUUID(), principal: 10000, fee: 1000, cashReceived: 11000, bank: 'KBANK', reference: 'legacy' };
     await api(route, legacy, 'POST', 201);
     await stop();
-    await client.query(`ALTER TABLE cash_transfers DROP COLUMN service_type;
+    await client.query(`ALTER TABLE cash_transfers DROP COLUMN rounding;
+        ALTER TABLE cash_transfers DROP COLUMN service_type;
         ALTER TABLE transfer_settings DROP COLUMN electricity_fee;
         CREATE UNIQUE INDEX cash_transfers_reference_idx ON cash_transfers (lower(bank), lower(reference))
             WHERE reference <> '' AND cancelled_at IS NULL`);
@@ -91,6 +92,7 @@ async function start() {
     token = (await api('/api/auth/login', { username: 'analytics_qa', password })).token;
     assert.equal((await api(route)).records[0].serviceType, 'TRANSFER');
     assert.equal((await api(route)).records[0].principal, 10000);
+    assert.equal((await api(route)).records[0].rounding, 0);
     await api(route, { ...legacy, id: crypto.randomUUID() }, 'POST', 409);
     await api(`${route}/${legacy.id}/cancel`, { reason: 'legacy QA cleanup' });
     const electricityRoute = `/api/app-sessions/${sessionId}/electricity`;
@@ -147,7 +149,43 @@ async function start() {
     assert.equal((await api('/api/store-settings')).electricityFee, 1550);
     assert.equal((await api(route)).totals.count, 1);
     assert.equal((await client.query("SELECT COUNT(*)::int AS count FROM audit_logs WHERE entity_type = 'ELECTRICITY_PAYMENT'")).rows[0].count, 3);
-    console.log('PASS: legacy schema migration and transfer preservation, electricity settings, owner permissions, money validation, idempotency, route isolation, repeat meter IDs, cancellation, closing, reporting and restart persistence');
+    const roundedPayment = { id: crypto.randomUUID(), principal: 12345, fee: 1055, rounding: 55, cashReceived: 20000, reference: 'rounding-meter' };
+    await api(electricityRoute, { ...roundedPayment, cashReceived: 13345 }, 'POST', 400);
+    await api(electricityRoute, { ...roundedPayment, rounding: -1 }, 'POST', 400);
+    await api(electricityRoute, { ...roundedPayment, rounding: 100 }, 'POST', 400);
+    await api(electricityRoute, { ...roundedPayment, rounding: .55 }, 'POST', 400);
+    await api(electricityRoute, { ...roundedPayment, rounding: 55, fee: 50 }, 'POST', 400);
+    await api(electricityRoute, { ...roundedPayment, fee: 1000, rounding: 0 }, 'POST', 400);
+    await api(route, { ...roundedPayment, bank: 'KBANK' }, 'POST', 400);
+    const rounded = await api(electricityRoute, roundedPayment, 'POST', 201);
+    assert.equal(rounded.principal, 12345);
+    assert.equal(rounded.fee, 1055);
+    assert.equal(rounded.rounding, 55);
+    assert.equal(rounded.change, 6600);
+    await api(electricityRoute, roundedPayment, 'POST', 201);
+    await api(electricityRoute, { ...roundedPayment, rounding: 54 }, 'POST', 409);
+    const roundedTotals = (await api(electricityRoute)).totals;
+    assert.equal(roundedTotals.rounding, 55);
+    assert.equal(roundedTotals.fee, 1550 + 1055);
+    assert.equal(roundedTotals.principal, 123456 + 12345);
+    assert.equal((await api(`/api/app-sessions/${sessionId}/closing-summary`)).sections.electricity.rounding, 55);
+    const roundedAnalytics = await api(`/api/analytics/sales?period=day&date=${stamp.day}`);
+    assert.equal(roundedAnalytics.transfers.find(row => row.id === rounded.id).rounding, 55);
+    assert.equal((await api(`/api/tax-report?month=${stamp.day.slice(0, 7)}`)).transfers.find(row => row.id === rounded.id).principal, 12345);
+    await stop(); await start();
+    token = (await api('/api/auth/login', { username: 'analytics_qa', password })).token;
+    assert.equal((await api(electricityRoute)).records.find(row => row.id === rounded.id).rounding, 55);
+    await api(`${electricityRoute}/${rounded.id}/cancel`, { reason: 'rounding QA cancellation' });
+    assert.equal((await api(electricityRoute)).totals.rounding, 0);
+    for (const [principal, baseFee, rounding] of [[10000, 1000, 0], [10001, 1000, 99], [10099, 1000, 1], [12345, 1550, 5], [12345, 0, 55]]) {
+        const fee = baseFee + rounding;
+        const result = await api(electricityRoute, { id: crypto.randomUUID(), principal, fee, rounding, cashReceived: principal + fee }, 'POST', 201);
+        assert.equal(result.principal, principal);
+        assert.equal(result.fee - result.rounding, baseFee);
+        assert.equal(result.change, 0);
+        assert.equal((result.principal + result.fee) % 100, 0);
+    }
+    console.log('PASS: legacy migration, electricity settings/permissions, original principal retained, rounded collection/change, whole-baht/no-fee/fractional-fee boundaries, validation, idempotency, cancellation, fee revenue and rounding audit, reporting/closing and restart persistence');
 })().catch(error => { console.error(error.message); process.exitCode = 1; }).finally(async () => {
     await stop();
     if (client) await client.end();

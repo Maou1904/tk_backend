@@ -18,6 +18,8 @@ async function initializeStoreOperations(pool) {
         CREATE INDEX IF NOT EXISTS cash_transfers_created_idx ON cash_transfers (created_at);
         ALTER TABLE cash_transfers ADD COLUMN IF NOT EXISTS service_type TEXT NOT NULL DEFAULT 'TRANSFER'
             CHECK (service_type IN ('TRANSFER', 'ELECTRICITY'));
+        ALTER TABLE cash_transfers ADD COLUMN IF NOT EXISTS rounding BIGINT NOT NULL DEFAULT 0
+            CHECK (rounding >= 0 AND rounding < 100 AND rounding <= fee AND (service_type = 'ELECTRICITY' OR rounding = 0));
         CREATE UNIQUE INDEX IF NOT EXISTS cash_transfers_bank_reference_idx
             ON cash_transfers (lower(bank), lower(reference)) WHERE service_type = 'TRANSFER' AND reference <> '' AND cancelled_at IS NULL;
         DROP INDEX IF EXISTS cash_transfers_reference_idx;
@@ -114,6 +116,7 @@ function clean(value, limit = 250) {
 function transfer(row) {
     return {
         id: row.id, serviceType: row.service_type || 'TRANSFER', principal: Number(row.principal), fee: Number(row.fee),
+        rounding: Number(row.rounding || 0),
         cashReceived: Number(row.cash_received), change: Number(row.cash_received) - Number(row.principal) - Number(row.fee),
         bank: row.bank, reference: row.reference, note: row.note, createdAt: row.created_at,
         cancelledAt: row.cancelled_at, cancelReason: row.cancel_reason,
@@ -126,6 +129,7 @@ async function transferClosingTotals(client, sessionId, serviceType = 'TRANSFER'
         SELECT COUNT(*) AS records, COUNT(*) FILTER (WHERE cancelled_at IS NULL) AS count,
                SUM(principal) FILTER (WHERE cancelled_at IS NULL) AS principal,
                SUM(fee) FILTER (WHERE cancelled_at IS NULL) AS fee,
+               SUM(rounding) FILTER (WHERE cancelled_at IS NULL) AS rounding,
                SUM(cash_received) FILTER (WHERE cancelled_at IS NULL) AS cash,
                SUM(cash_received - principal - fee) FILTER (WHERE cancelled_at IS NULL) AS change
         FROM cash_transfers WHERE session_id = $1 AND service_type = $2
@@ -262,6 +266,15 @@ function registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession
             const id = identifier(req.body.id);
             const principal = satang(req.body.principal, 1);
             const fee = satang(req.body.fee);
+            // fee remains total shop income so existing reports reconcile; rounding is its explicit breakdown.
+            const rounding = satang(req.body.rounding ?? 0);
+            if (rounding > 99 || rounding > fee || (serviceType !== 'ELECTRICITY' && rounding !== 0)) {
+                throw problem(400, 'ส่วนปัดเศษไม่ถูกต้อง');
+            }
+            if (req.body.rounding !== undefined && serviceType === 'ELECTRICITY' &&
+                rounding !== (100 - (principal + fee - rounding) % 100) % 100) {
+                throw problem(400, 'ยอดจ่ายค่าไฟต้องปัดยอดรวมขึ้นเป็นบาทเต็ม');
+            }
             const cash = satang(req.body.cashReceived);
             const bank = clean(req.body.bank, 60);
             const reference = clean(req.body.reference, 100);
@@ -272,14 +285,14 @@ function registerStoreOperations(app, { pool, requireOwner, ensureOpenAppSession
             const record = await transaction(async (client) => {
                 const session = await ensureOpenAppSession(req.params.sessionId, client);
                 const { rows: [row] } = await client.query(`
-                    INSERT INTO cash_transfers (id, session_id, principal, fee, cash_received, bank, reference, note, created_by, service_type)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                    INSERT INTO cash_transfers (id, session_id, principal, fee, cash_received, bank, reference, note, created_by, service_type, rounding)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                     ON CONFLICT (id) DO NOTHING RETURNING *
-                `, [id, session.session_id, principal, fee, cash, bank, reference, note, req.user.id, serviceType]);
+                `, [id, session.session_id, principal, fee, cash, bank, reference, note, req.user.id, serviceType, rounding]);
                 if (!row) {
                     const { rows: [existing] } = await client.query(`${transferListSql} WHERE t.id = $1`, [id]);
                     if (existing.service_type !== serviceType || existing.session_id !== session.session_id || existing.created_by !== req.user.id ||
-                        Number(existing.principal) !== principal || Number(existing.fee) !== fee ||
+                        Number(existing.principal) !== principal || Number(existing.fee) !== fee || Number(existing.rounding) !== rounding ||
                         Number(existing.cash_received) !== cash || existing.bank !== bank ||
                         existing.reference !== reference || existing.note !== note) {
                         throw problem(409, 'รหัสนี้ถูกใช้บันทึกรายการแล้ว');
